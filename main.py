@@ -5,7 +5,11 @@ import threading
 import time
 import uuid
 import warnings
+import inspect
 from typing import Any, Optional
+
+import optiq  # registers qwen3_5_text model type with mlx_lm
+from optiq.core.turbo_kv_cache import TurboQuantKVCache, patch_attention
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -15,8 +19,13 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-DEFAULT_MODEL_NAME = "mlx-community/Qwen3-14B-4bit"
-STALE_MODEL_ALIASES = {"mlx", "mlx-community"}
+DEFAULT_MODEL_NAME = "mlx-community/Qwen3.5-4B-OptiQ-4bit"
+STALE_MODEL_ALIASES = {
+    "mlx",
+    "mlx-community",
+    "mlx-community/Qwen3-14B-4bit",
+    "PewterZz/OmniCoder-9B-abliterated-MLX-4bit",
+}
 
 
 def resolve_model_name() -> str:
@@ -36,7 +45,33 @@ MODEL_NAME = resolve_model_name()
 PUBLIC_MODEL_NAME = MODEL_NAME
 
 model, tokenizer = load(MODEL_NAME)
+# Qwen3.5 tokenizer update moved EOS to <|endoftext|> (248044) but the chat
+# template still uses <|im_end|> (248046) as the turn terminator. Add it so
+# the generator stops there instead of bleeding into hallucinated next turns.
+_im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+if _im_end_id and _im_end_id not in tokenizer.eos_token_ids:
+    tokenizer.eos_token_ids.add(_im_end_id)
+patch_attention()
+_text_cfg = getattr(model.args, 'text_config', {})
+_head_dim = (_text_cfg.get('head_dim') if isinstance(_text_cfg, dict) else getattr(_text_cfg, 'head_dim', None)) or 128
 _inference_lock = threading.Lock()
+
+
+def _make_turbo_cache():
+    """Per-request cache: TurboQuantKVCache for full-attention layers, standard for linear-attention."""
+    from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+    caches = make_prompt_cache(model)
+    for i, c in enumerate(caches):
+        if isinstance(c, KVCache):
+            caches[i] = TurboQuantKVCache(head_dim=_head_dim, bits=4)
+    return caches
+
+
+try:
+    _MAKE_SAMPLER_PARAMS = set(inspect.signature(make_sampler).parameters)
+except (TypeError, ValueError):
+    _MAKE_SAMPLER_PARAMS = set()
 
 
 # ---------------------------------------------------------------------------
@@ -55,11 +90,14 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
-    max_tokens: Optional[int] = 1000
-    temperature: Optional[float] = 0.3
+    max_tokens: Optional[int] = 32768
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = None
+    presence_penalty: Optional[float] = None
     stream: Optional[bool] = False
     tools: Optional[list[Any]] = None
     tool_choice: Optional[Any] = None
+    extra_body: Optional[dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -125,17 +163,62 @@ def message_to_dict(m: ChatMessage) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _unescape_value(s: str, *, decode_control_escapes: bool) -> str:
+    """Decode escapes in a parsed tool argument value.
+
+    Qwen compact tool-call arguments may use <|"|>...<|"|> delimited strings.
+    Preserve source escapes for delimited strings so patch_file_tool can match
+    file contents such as `"one\\ntwo"` or `.join("\\n")`.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if decode_control_escapes and nxt == "n":
+                result.append("\n")
+                i += 2
+                continue
+            if decode_control_escapes and nxt == "t":
+                result.append("\t")
+                i += 2
+                continue
+            if decode_control_escapes and nxt == "r":
+                result.append("\r")
+                i += 2
+                continue
+            if nxt == "\\":
+                result.append("\\")
+                i += 2
+                continue
+            if nxt == '"':
+                result.append('"')
+                i += 2
+                continue
+            if nxt == "'":
+                result.append("'")
+                i += 2
+                continue
+        result.append(c)
+        i += 1
+    return "".join(result)
+
+
 def _normalize_qwen_args(raw: str) -> dict | None:
     trimmed = raw.strip()
     if trimmed.startswith("{{") and trimmed.endswith("}}"):
         trimmed = trimmed[1:-1]
 
-    normalized = trimmed.replace('<|"|>', '"')
-    normalized = re.sub(r"([{,]\s*)(\w+)\s*:", r'\1"\2":', normalized)
-    try:
-        return json.loads(normalized)
-    except (json.JSONDecodeError, ValueError):
-        pass
+    # Only attempt the fast json.loads path when there are NO <|"|> delimiters,
+    # since replacing them globally can collide with literal " inside values.
+    if "<|\"|>" not in trimmed:
+        normalized = re.sub(r"([{,]\s*)(\w+)\s*:", r'\1"\2":', trimmed)
+        try:
+            return json.loads(normalized)
+        except (json.JSONDecodeError, ValueError):
+            pass
 
     if not (trimmed.startswith("{") and trimmed.endswith("}")):
         return None
@@ -173,20 +256,35 @@ def _normalize_qwen_args(raw: str) -> dict | None:
             end = inner.find('<|"|>', i)
             if end == -1:
                 return None
-            value: Any = inner[i:end]
+            value: Any = _unescape_value(inner[i:end], decode_control_escapes=False)
             i = end + len('<|"|>')
         elif inner[i] == '"':
             i += 1
             start = i
-            while i < n and inner[i] != '"':
+            while i < n:
+                if inner[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if inner[i] == '"':
+                    break
                 i += 1
             if i >= n:
                 return None
-            value = inner[start:i]
+            value = _unescape_value(inner[start:i], decode_control_escapes=True)
             i += 1
         else:
             start = i
-            while i < n and inner[i] not in ",}":
+            depth = 0
+            while i < n:
+                ch = inner[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    break
                 i += 1
             token = inner[start:i].strip()
             if token in {"true", "false"}:
@@ -210,6 +308,72 @@ def _normalize_qwen_args(raw: str) -> dict | None:
             i += 1
 
     return args or None
+
+
+_QWEN_COMPACT_CALL_PREFIX = "<|tool_call>call:"
+
+
+def _parse_qwen_compact_call_name_and_body_start(
+    text: str, start: int
+) -> tuple[str, int] | None:
+    j = start + len(_QWEN_COMPACT_CALL_PREFIX)
+    name_start = j
+    while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+        j += 1
+    if j == name_start:
+        return None
+    name = text[name_start:j]
+    while j < len(text) and text[j].isspace():
+        j += 1
+    if j >= len(text) or text[j] != "{":
+        return None
+    return name, j
+
+
+def _scan_qwen_compact_body(text: str, body_start: int) -> tuple[str, int] | None:
+    depth = 0
+    k = body_start
+    while k < len(text):
+        if text.startswith('<|"|>', k):
+            k += len('<|"|>')
+            end = text.find('<|"|>', k)
+            if end < 0:
+                return None
+            k = end + len('<|"|>')
+            continue
+        c = text[k]
+        if c == "{":
+            depth += 1
+            k += 1
+        elif c == "}":
+            depth -= 1
+            k += 1
+            if depth == 0:
+                return text[body_start:k], k
+        else:
+            k += 1
+    return None
+
+
+def _scan_qwen_compact_calls(text: str) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
+    pos = 0
+    while True:
+        i = text.find(_QWEN_COMPACT_CALL_PREFIX, pos)
+        if i < 0:
+            break
+        parsed = _parse_qwen_compact_call_name_and_body_start(text, i)
+        if parsed is None:
+            pos = i + len(_QWEN_COMPACT_CALL_PREFIX)
+            continue
+        name, body_start = parsed
+        scanned = _scan_qwen_compact_body(text, body_start)
+        if scanned is None:
+            pos = body_start + 1
+            continue
+        body, pos = scanned
+        results.append((name, body))
+    return results
 
 
 def extract_tool_calls(text: str) -> list[dict] | None:
@@ -310,13 +474,8 @@ def extract_tool_calls(text: str) -> list[dict] | None:
         print(f"[mlxsv] extract_tool_calls matched={matched_path} count={len(calls)}")
         return calls
 
-    for m in re.finditer(
-        r"<\|tool_call>call:(\w+)\s*(\{\{.*?\}\}|\{.*?\})(?:<tool_call\|>)?",
-        text,
-        re.DOTALL,
-    ):
-        name = m.group(1)
-        args = _normalize_qwen_args(m.group(2))
+    for name, body in _scan_qwen_compact_calls(text):
+        args = _normalize_qwen_args(body)
         if args is not None:
             matched_path = "qwen_compact_native"
             calls.append(
@@ -338,15 +497,41 @@ def extract_tool_calls(text: str) -> list[dict] | None:
     return None
 
 
+_MAX_TOOL_CALLS = 3
+
+
+def _dedup_cap_calls(calls: list[dict]) -> list[dict]:
+    """Deduplicate by (name, arguments) and cap at _MAX_TOOL_CALLS."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for c in calls:
+        fn = c.get("function", {})
+        key = (fn.get("name", ""), fn.get("arguments", ""))
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+            if len(out) >= _MAX_TOOL_CALLS:
+                break
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Output cleaning
 # ---------------------------------------------------------------------------
 
 
 def clean_output(text: str) -> str:
-    """Minimal cleaning: remove control tokens but preserve <thinking> blocks."""
-    for token in ["<|im_end|>", "<|im_start|>"]:
+    """Remove control tokens and thinking blocks."""
+    # Truncate at the first <|im_end|> — that is the model's own end-of-turn
+    # marker. Everything after it is the hallucinated next conversation turn
+    # (<|im_start|>user\n...<|im_start|>assistant\n... repeating tool calls).
+    # Truncate before stripping so the marker still serves as a boundary.
+    first_im_end = text.find("<|im_end|>")
+    if first_im_end != -1:
+        text = text[:first_im_end]
+    for token in ["<turn|>", "<|turn>"]:
         text = text.replace(token, "")
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return text.strip()
 
 
@@ -354,8 +539,8 @@ def clean_output(text: str) -> str:
 # Context truncation
 # ---------------------------------------------------------------------------
 
-_MAX_CONTEXT_CHARS = 60_000
-_MAX_ANCHOR_CHARS = 45_000
+_MAX_CONTEXT_CHARS = 100_000
+_MAX_ANCHOR_CHARS = 75_000
 
 
 def _msg_chars(msg: dict) -> int:
@@ -368,6 +553,29 @@ def _msg_chars(msg: dict) -> int:
 def _is_tool_response(msg: dict) -> bool:
     content = msg.get("content") or ""
     return isinstance(content, str) and content.startswith("<tool_response>")
+
+
+def _batch_tool_responses(messages: list[dict]) -> list[dict]:
+    """Merge consecutive tool-response user messages into one user message.
+
+    The Qwen3.5 chat template expects all tool results for a turn in a single
+    user message with multiple <tool_response> blocks, not separate messages.
+    """
+    out: list[dict] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if _is_tool_response(msg):
+            combined = msg["content"]
+            i += 1
+            while i < len(messages) and _is_tool_response(messages[i]):
+                combined += "\n" + messages[i]["content"]
+                i += 1
+            out.append({"role": "user", "content": combined})
+        else:
+            out.append(msg)
+            i += 1
+    return out
 
 
 def _trim_anchor(anchor: list[dict]) -> list[dict]:
@@ -475,33 +683,147 @@ def list_models():
     }
 
 
-@app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest):
-    messages = [message_to_dict(m) for m in req.messages]
-    messages = truncate_messages(messages)
-    print(
-        f"[mlxsv] chat_completions tools_in_request={len(req.tools or [])} messages={len(messages)}"
-    )
+def _extract_thought(text: str) -> str | None:
+    """Return the raw thinking block from model output, or None if absent."""
+    m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _extra_body(req: ChatCompletionRequest) -> dict[str, Any]:
+    return req.extra_body if isinstance(req.extra_body, dict) else {}
+
+
+def _chat_template_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
+    extra = _extra_body(req)
+    value = extra.get("chat_template_kwargs")
+    return value if isinstance(value, dict) else {}
+
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _requested_enable_thinking(
+    req: ChatCompletionRequest, messages: list[dict[str, Any]]
+) -> bool:
+    """Prefer explicit API config; keep /no_think only as a compatibility fallback."""
+    template_kwargs = _chat_template_kwargs(req)
+    explicit = _coerce_bool(template_kwargs.get("enable_thinking"))
+    if explicit is not None:
+        return explicit
+
+    explicit = _coerce_bool(_extra_body(req).get("enable_thinking"))
+    if explicit is not None:
+        return explicit
 
     no_think = any(
         "/no_think" in (msg.get("content") or "")
         for msg in messages
         if msg.get("role") == "system"
     )
+    return not no_think
+
+
+def _extra_number(req: ChatCompletionRequest, key: str) -> Any:
+    return _extra_body(req).get(key)
+
+
+def _log_first_message(messages: list[dict[str, Any]]) -> None:
+    if not messages:
+        print("[mlxsv] first_model_message role=<none> chars=0 preview=", flush=True)
+        return
+
+    first = messages[0]
+    content = normalize_content(first.get("content"))
+    preview = content[:300].replace("\n", "\\n")
+    print(
+        f"[mlxsv] first_model_message role={first.get('role', '<missing>')} "
+        f"chars={len(content)} preview={preview}",
+        flush=True,
+    )
+
+
+def _make_qwen_sampler(req: ChatCompletionRequest):
+    temperature = req.temperature if req.temperature is not None else 0.7
+    kwargs: dict[str, Any] = {}
+
+    candidates = {
+        "top_p": req.top_p,
+        "min_p": _extra_number(req, "min_p"),
+        "top_k": _extra_number(req, "top_k"),
+        "repetition_penalty": _extra_number(req, "repetition_penalty"),
+        "presence_penalty": req.presence_penalty,
+    }
+    for key, value in candidates.items():
+        if value is not None and key in _MAKE_SAMPLER_PARAMS:
+            kwargs[key] = value
+
+    if "temp" in _MAKE_SAMPLER_PARAMS:
+        return make_sampler(temp=temperature, **kwargs)
+    if "temperature" in _MAKE_SAMPLER_PARAMS:
+        return make_sampler(temperature=temperature, **kwargs)
+    return make_sampler(temperature, **kwargs)
+
+
+@app.post("/v1/chat/completions")
+def chat_completions(req: ChatCompletionRequest):
+    messages = [message_to_dict(m) for m in req.messages]
+    messages = _batch_tool_responses(messages)
+    messages = truncate_messages(messages)
+
+    requested_enable_thinking = _requested_enable_thinking(req, messages)
+
+    print(
+        f"[mlxsv] chat_completions tools_in_request={len(req.tools or [])} "
+        f"messages={len(messages)} enable_thinking={requested_enable_thinking}",
+        flush=True,
+    )
+    _log_first_message(messages)
 
     template_kwargs: dict[str, Any] = {
         "tokenize": False,
         "add_generation_prompt": True,
-        "enable_thinking": not no_think,
     }
+    for key, value in _chat_template_kwargs(req).items():
+        if key not in {"tools"}:
+            template_kwargs[key] = value
+    template_kwargs["enable_thinking"] = requested_enable_thinking
     if req.tools:
         template_kwargs["tools"] = req.tools
 
     try:
         prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
-    except Exception:
-        template_kwargs.pop("tools", None)
-        prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+    except Exception as e:
+        # Drop enable_thinking first — keep tools so the model sees the schemas.
+        dropped = template_kwargs.pop("enable_thinking", None)
+        if dropped is not None:
+            print(f"[mlxsv] template_warning dropped=enable_thinking reason={e!r}")
+        if dropped is False:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Qwen3.5 non-thinking mode requires chat_template_kwargs.enable_thinking=False support in the tokenizer chat template.",
+                        "type": "template_configuration_error",
+                    }
+                },
+                status_code=500,
+            )
+        try:
+            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+        except Exception as e2:
+            template_kwargs.pop("tools", None)
+            print(f"[mlxsv] template_warning dropped=tools reason={e2!r}")
+            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
@@ -515,8 +837,9 @@ def chat_completions(req: ChatCompletionRequest):
                         model,
                         tokenizer,
                         prompt=prompt,
-                        max_tokens=req.max_tokens or 2500,
-                        sampler=make_sampler(req.temperature or 0.3),
+                        max_tokens=req.max_tokens or 32768,
+                        sampler=_make_qwen_sampler(req),
+                        prompt_cache=_make_turbo_cache(),
                     ):
                         token = resp.text
                         accumulated += token
@@ -533,8 +856,9 @@ def chat_completions(req: ChatCompletionRequest):
                     raw = generate(
                         model, tokenizer,
                         prompt=prompt,
-                        max_tokens=req.max_tokens or 2500,
-                        sampler=make_sampler(req.temperature or 0.3),
+                        max_tokens=req.max_tokens or 32768,
+                        sampler=_make_qwen_sampler(req),
+                        prompt_cache=_make_turbo_cache(),
                     )
                     accumulated = raw
                     delta_chunk = {
@@ -548,8 +872,9 @@ def chat_completions(req: ChatCompletionRequest):
 
             # After stream ends, parse tool calls from full accumulated text.
             text = clean_output(accumulated)
-            print(f"[mlxsv] raw_output={text[:800]!r}")
-            tool_calls = extract_tool_calls(text) if req.tools else None
+            print(f"[mlxsv] raw_output={text[:2000]!r}")
+            raw_calls = extract_tool_calls(text) if req.tools else None
+            tool_calls = _dedup_cap_calls(raw_calls) if raw_calls else None
             finish_reason = "tool_calls" if tool_calls else "stop"
             print(f"[mlxsv] finish_reason={finish_reason} tool_call_count={len(tool_calls or [])}")
 
@@ -574,13 +899,15 @@ def chat_completions(req: ChatCompletionRequest):
             model,
             tokenizer,
             prompt=prompt,
-            max_tokens=req.max_tokens or 2500,
-            sampler=make_sampler(req.temperature or 0.3),
+            max_tokens=req.max_tokens or 32768,
+            sampler=_make_qwen_sampler(req),
+            prompt_cache=_make_turbo_cache(),
         )
 
     text = clean_output(raw)
-    print(f"[mlxsv] raw_output={text[:800]!r}")
-    tool_calls = extract_tool_calls(text) if req.tools else None
+    print(f"[mlxsv] raw_output={text[:2000]!r}")
+    raw_calls = extract_tool_calls(text) if req.tools else None
+    tool_calls = _dedup_cap_calls(raw_calls) if raw_calls else None
     finish_reason = "tool_calls" if tool_calls else "stop"
     reasoning = extract_reasoning(text) if tool_calls else text
 
