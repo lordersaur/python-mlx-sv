@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import re
@@ -5,11 +6,15 @@ import threading
 import time
 import uuid
 import warnings
-import inspect
 from typing import Any, Optional
 
-import optiq  # registers qwen3_5_text model type with mlx_lm
-from optiq.core.turbo_kv_cache import TurboQuantKVCache, patch_attention
+try:
+    import optiq  # registers qwen3_5_text model type with mlx_lm
+    from optiq.core.turbo_kv_cache import TurboQuantKVCache, patch_attention
+
+    _HAS_TURBO = True
+except Exception:
+    _HAS_TURBO = False
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,10 +24,11 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-DEFAULT_MODEL_NAME = "mlx-community/Qwen3.5-4B-OptiQ-4bit"
+DEFAULT_MODEL_NAME = "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
 STALE_MODEL_ALIASES = {
     "mlx",
     "mlx-community",
+    "mlx-community/Qwen3.5-4B-OptiQ-4bit",
     "mlx-community/Qwen3-14B-4bit",
     "PewterZz/OmniCoder-9B-abliterated-MLX-4bit",
 }
@@ -43,23 +49,37 @@ def resolve_model_name() -> str:
 
 MODEL_NAME = resolve_model_name()
 PUBLIC_MODEL_NAME = MODEL_NAME
+MODEL_FAMILY = "gemma4" if "gemma-4" in MODEL_NAME.lower() else "generic"
 
 model, tokenizer = load(MODEL_NAME)
-# Qwen3.5 tokenizer update moved EOS to <|endoftext|> (248044) but the chat
-# template still uses <|im_end|> (248046) as the turn terminator. Add it so
-# the generator stops there instead of bleeding into hallucinated next turns.
-_im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-if _im_end_id and _im_end_id not in tokenizer.eos_token_ids:
-    tokenizer.eos_token_ids.add(_im_end_id)
-patch_attention()
-_text_cfg = getattr(model.args, 'text_config', {})
-_head_dim = (_text_cfg.get('head_dim') if isinstance(_text_cfg, dict) else getattr(_text_cfg, 'head_dim', None)) or 128
+if _HAS_TURBO:
+    patch_attention()
+_eos_ids = getattr(tokenizer, "eos_token_ids", None)
+if _eos_ids is not None:
+    for _token in ("<turn|>", "<end_of_turn>", "<|end_of_turn|>"):
+        _token_id = tokenizer.convert_tokens_to_ids(_token)
+        if isinstance(_token_id, int) and _token_id >= 0 and _token_id not in _eos_ids:
+            if hasattr(_eos_ids, "add"):
+                _eos_ids.add(_token_id)
+            else:
+                _eos_ids.append(_token_id)
+_text_cfg = getattr(model.args, "text_config", {})
+_head_dim = (
+    _text_cfg.get("head_dim")
+    if isinstance(_text_cfg, dict)
+    else getattr(_text_cfg, "head_dim", None)
+) or 128
 _inference_lock = threading.Lock()
 
 
 def _make_turbo_cache():
-    """Per-request cache: TurboQuantKVCache for full-attention layers, standard for linear-attention."""
-    from mlx_lm.models.cache import KVCache, make_prompt_cache
+    from mlx_lm.models.cache import make_prompt_cache
+
+    # ❗ disable Turbo for Gemma
+    if not _HAS_TURBO or MODEL_FAMILY == "gemma4":
+        return make_prompt_cache(model)
+
+    from mlx_lm.models.cache import KVCache
 
     caches = make_prompt_cache(model)
     for i, c in enumerate(caches):
@@ -123,7 +143,39 @@ def normalize_content(content: Any) -> str:
     return str(content)
 
 
-def message_to_dict(m: ChatMessage) -> dict:
+def _safe_tool_content(raw: str) -> str:
+    return re.sub(
+        r"<(/?tool_call|function=\w+|/function|parameter=\w+|/parameter)>",
+        r"[\1]",
+        raw,
+    )
+
+
+def _tool_response_payload(raw: str) -> Any:
+    try:
+        val = json.loads(raw)
+        return val if val is not None else "null"
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _safe_tool_content(raw)
+
+
+def _tool_call_name_by_id(tool_calls: Any) -> dict[str, str]:
+    names: dict[str, str] = {}
+    if not isinstance(tool_calls, list):
+        return names
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        call_id = tc.get("id")
+        function = tc.get("function")
+        if isinstance(call_id, str) and isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str) and name:
+                names[call_id] = name
+    return names
+
+
+def message_to_dict(m: ChatMessage, tool_names: dict[str, str] | None = None) -> dict:
     """Convert a ChatMessage to the dict format expected by apply_chat_template."""
     if m.role == "assistant" and m.tool_calls:
         cooked: list[Any] = []
@@ -148,14 +200,43 @@ def message_to_dict(m: ChatMessage) -> dict:
         # that contain <function=...> or <tool_call> code examples) so the parser
         # doesn't fire on them when this result re-enters the context.
         raw = normalize_content(m.content)
-        safe = re.sub(r"<(/?tool_call|function=\w+|/function|parameter=\w+|/parameter)>", r"[\1]", raw)
-        msg = {
-            "role": "user",
-            "content": f"<tool_response>\n{safe}\n</tool_response>",
-        }
+        if MODEL_FAMILY == "gemma4":
+            name = (
+                m.name
+                or (tool_names or {}).get(m.tool_call_id or "")
+                or (m.tool_call_id or "tool")
+            )
+            msg = {
+                "role": "tool",
+                "content": "",
+                "tool_call_id": m.tool_call_id or "0",
+                "tool_responses": [
+                    {
+                        "name": name,
+                        "response": _tool_response_payload(raw),
+                    }
+                ],
+            }
+        else:
+            msg = {
+                "role": "user",
+                "content": f"<tool_response>\n{_safe_tool_content(raw)}\n</tool_response>",
+            }
     else:
         msg = {"role": m.role, "content": normalize_content(m.content)}
     return msg
+
+
+def messages_to_dicts(messages: list[ChatMessage]) -> list[dict]:
+    """Convert messages while preserving tool-call id -> function name context."""
+    out: list[dict] = []
+    tool_names: dict[str, str] = {}
+    for message in messages:
+        converted = message_to_dict(message, tool_names)
+        out.append(converted)
+        if message.role == "assistant" and message.tool_calls:
+            tool_names.update(_tool_call_name_by_id(converted.get("tool_calls")))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +294,7 @@ def _normalize_qwen_args(raw: str) -> dict | None:
 
     # Only attempt the fast json.loads path when there are NO <|"|> delimiters,
     # since replacing them globally can collide with literal " inside values.
-    if "<|\"|>" not in trimmed:
+    if '<|"|>' not in trimmed:
         normalized = re.sub(r"([{,]\s*)(\w+)\s*:", r'\1"\2":', trimmed)
         try:
             return json.loads(normalized)
@@ -310,13 +391,13 @@ def _normalize_qwen_args(raw: str) -> dict | None:
     return args or None
 
 
-_QWEN_COMPACT_CALL_PREFIX = "<|tool_call>call:"
+_COMPACT_CALL_PREFIX = "<|tool_call>call:"
 
 
 def _parse_qwen_compact_call_name_and_body_start(
     text: str, start: int
 ) -> tuple[str, int] | None:
-    j = start + len(_QWEN_COMPACT_CALL_PREFIX)
+    j = start + len(_COMPACT_CALL_PREFIX)
     name_start = j
     while j < len(text) and (text[j].isalnum() or text[j] == "_"):
         j += 1
@@ -359,12 +440,12 @@ def _scan_qwen_compact_calls(text: str) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     pos = 0
     while True:
-        i = text.find(_QWEN_COMPACT_CALL_PREFIX, pos)
+        i = text.find(_COMPACT_CALL_PREFIX, pos)
         if i < 0:
             break
         parsed = _parse_qwen_compact_call_name_and_body_start(text, i)
         if parsed is None:
-            pos = i + len(_QWEN_COMPACT_CALL_PREFIX)
+            pos = i + len(_COMPACT_CALL_PREFIX)
             continue
         name, body_start = parsed
         scanned = _scan_qwen_compact_body(text, body_start)
@@ -477,7 +558,9 @@ def extract_tool_calls(text: str) -> list[dict] | None:
     for name, body in _scan_qwen_compact_calls(text):
         args = _normalize_qwen_args(body)
         if args is not None:
-            matched_path = "qwen_compact_native"
+            matched_path = (
+                "gemma_native" if MODEL_FAMILY == "gemma4" else "qwen_compact_native"
+            )
             calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -522,16 +605,34 @@ def _dedup_cap_calls(calls: list[dict]) -> list[dict]:
 
 def clean_output(text: str) -> str:
     """Remove control tokens and thinking blocks."""
-    # Truncate at the first <|im_end|> — that is the model's own end-of-turn
-    # marker. Everything after it is the hallucinated next conversation turn
-    # (<|im_start|>user\n...<|im_start|>assistant\n... repeating tool calls).
-    # Truncate before stripping so the marker still serves as a boundary.
-    first_im_end = text.find("<|im_end|>")
-    if first_im_end != -1:
-        text = text[:first_im_end]
-    for token in ["<turn|>", "<|turn>"]:
+    # Truncate at model turn boundaries before stripping markers so raw tool calls
+    # remain parseable while hallucinated next turns do not bleed into the result.
+    boundaries = [
+        "<|im_end|>",
+        "<turn|>",
+        "<|turn>user",
+        "<|turn>system",
+        "<|turn>assistant",
+        "<|turn>model",
+    ]
+    cut = min(
+        [idx for marker in boundaries if (idx := text.find(marker)) != -1]
+        or [len(text)]
+    )
+    text = text[:cut]
+    text = re.sub(r"(?s)<\|channel>thought\s*.*?<channel\|>", "", text)
+    text = re.sub(r"(?s)<\|think\|>.*?<\|/think\|>", "", text)
+    text = re.sub(r"(?s)<think>.*?</think>", "", text)
+    text = re.sub(r"(?s)<thinking>.*?</thinking>", "", text)
+    for token in [
+        "<turn|>",
+        "<|turn>",
+        "<|think|>",
+        "<|/think|>",
+        "<|channel>thought",
+        "<channel|>",
+    ]:
         text = text.replace(token, "")
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return text.strip()
 
 
@@ -547,10 +648,14 @@ def _msg_chars(msg: dict) -> int:
     total = len(str(msg.get("content") or ""))
     for tc in msg.get("tool_calls") or []:
         total += len(str(tc))
+    for tr in msg.get("tool_responses") or []:
+        total += len(str(tr))
     return total
 
 
 def _is_tool_response(msg: dict) -> bool:
+    if msg.get("role") == "tool":
+        return False
     content = msg.get("content") or ""
     return isinstance(content, str) and content.startswith("<tool_response>")
 
@@ -685,9 +790,15 @@ def list_models():
 
 def _extract_thought(text: str) -> str | None:
     """Return the raw thinking block from model output, or None if absent."""
-    m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
+    for pattern in [
+        r"(?s)<\|channel>thought\s*(.*?)<channel\|>",
+        r"(?s)<\|think\|>(.*?)<\|/think\|>",
+        r"(?s)<think>(.*?)</think>",
+        r"(?s)<thinking>(.*?)</thinking>",
+    ]:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
     return None
 
 
@@ -753,7 +864,7 @@ def _log_first_message(messages: list[dict[str, Any]]) -> None:
     )
 
 
-def _make_qwen_sampler(req: ChatCompletionRequest):
+def _make_sampler(req: ChatCompletionRequest):
     temperature = req.temperature if req.temperature is not None else 0.7
     kwargs: dict[str, Any] = {}
 
@@ -777,7 +888,7 @@ def _make_qwen_sampler(req: ChatCompletionRequest):
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
-    messages = [message_to_dict(m) for m in req.messages]
+    messages = messages_to_dicts(req.messages)
     messages = _batch_tool_responses(messages)
     messages = truncate_messages(messages)
 
@@ -812,7 +923,7 @@ def chat_completions(req: ChatCompletionRequest):
             return JSONResponse(
                 {
                     "error": {
-                        "message": "Qwen3.5 non-thinking mode requires chat_template_kwargs.enable_thinking=False support in the tokenizer chat template.",
+                        "message": "Non-thinking mode requires chat_template_kwargs.enable_thinking=False support in the tokenizer chat template.",
                         "type": "template_configuration_error",
                     }
                 },
@@ -828,17 +939,19 @@ def chat_completions(req: ChatCompletionRequest):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     if req.stream:
+
         def event_stream():
             accumulated = ""
             with _inference_lock:
                 try:
                     from mlx_lm import stream_generate as _stream_gen
+
                     for resp in _stream_gen(
                         model,
                         tokenizer,
                         prompt=prompt,
                         max_tokens=req.max_tokens or 32768,
-                        sampler=_make_qwen_sampler(req),
+                        sampler=_make_sampler(req),
                         prompt_cache=_make_turbo_cache(),
                     ):
                         token = resp.text
@@ -848,16 +961,23 @@ def chat_completions(req: ChatCompletionRequest):
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": PUBLIC_MODEL_NAME,
-                            "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": token},
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
                         yield f"data: {json.dumps(delta_chunk)}\n\n"
                 except Exception:
                     # Fallback: generate all at once, send as single chunk
                     raw = generate(
-                        model, tokenizer,
+                        model,
+                        tokenizer,
                         prompt=prompt,
                         max_tokens=req.max_tokens or 32768,
-                        sampler=_make_qwen_sampler(req),
+                        sampler=_make_sampler(req),
                         prompt_cache=_make_turbo_cache(),
                     )
                     accumulated = raw
@@ -866,7 +986,13 @@ def chat_completions(req: ChatCompletionRequest):
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": PUBLIC_MODEL_NAME,
-                        "choices": [{"index": 0, "delta": {"content": accumulated}, "finish_reason": None}],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": accumulated},
+                                "finish_reason": None,
+                            }
+                        ],
                     }
                     yield f"data: {json.dumps(delta_chunk)}\n\n"
 
@@ -876,7 +1002,9 @@ def chat_completions(req: ChatCompletionRequest):
             raw_calls = extract_tool_calls(text) if req.tools else None
             tool_calls = _dedup_cap_calls(raw_calls) if raw_calls else None
             finish_reason = "tool_calls" if tool_calls else "stop"
-            print(f"[mlxsv] finish_reason={finish_reason} tool_call_count={len(tool_calls or [])}")
+            print(
+                f"[mlxsv] finish_reason={finish_reason} tool_call_count={len(tool_calls or [])}"
+            )
 
             final_delta: dict[str, Any] = {}
             if tool_calls:
@@ -886,7 +1014,9 @@ def chat_completions(req: ChatCompletionRequest):
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": PUBLIC_MODEL_NAME,
-                "choices": [{"index": 0, "delta": final_delta, "finish_reason": finish_reason}],
+                "choices": [
+                    {"index": 0, "delta": final_delta, "finish_reason": finish_reason}
+                ],
             }
             yield f"data: {json.dumps(final_chunk)}\n\n"
             yield "data: [DONE]\n\n"
@@ -900,7 +1030,7 @@ def chat_completions(req: ChatCompletionRequest):
             tokenizer,
             prompt=prompt,
             max_tokens=req.max_tokens or 32768,
-            sampler=_make_qwen_sampler(req),
+            sampler=_make_sampler(req),
             prompt_cache=_make_turbo_cache(),
         )
 
