@@ -20,7 +20,8 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-DEFAULT_MODEL_NAME = "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
+DEFAULT_MODEL_NAME = "mlx-community/gemma-4-e4b-it-8bit"
+# DEFAULT_MODEL_NAME = "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
 
 
 def resolve_model_name() -> str:
@@ -737,7 +738,7 @@ def _is_gemma_native_model(model_name: str) -> bool:
 
 
 def _consolidate_system_messages(
-    messages: list[dict[str, Any]]
+    messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Gemma 4 expects thinking/tool setup consolidated in one system turn."""
     system_parts = [
@@ -840,7 +841,7 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
         f"messages={len(messages)} enable_thinking={requested_enable_thinking}",
         flush=True,
     )
-    _log_first_message(messages)
+    # _log_first_message(messages)
 
     template_kwargs: dict[str, Any] = {
         "tokenize": False,
@@ -893,8 +894,10 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                         token = resp.text
                         accumulated += token
                         if req.tools:
-                            chunk, tool_thought_emitted = _tool_streamable_thought_delta(
-                                accumulated, tool_thought_emitted
+                            chunk, tool_thought_emitted = (
+                                _tool_streamable_thought_delta(
+                                    accumulated, tool_thought_emitted
+                                )
                             )
                             if chunk:
                                 delta_chunk = {
@@ -964,7 +967,9 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
             text = clean_output(accumulated)
             print(f"[mlxsv] raw_output={text[:2000]!r}")
             raw_calls = (
-                extract_tool_calls(text, req.tools) if (req.tools and gemma_native) else None
+                extract_tool_calls(text, req.tools)
+                if (req.tools and gemma_native)
+                else None
             )
             tool_calls = _dedup_cap_calls(raw_calls) if raw_calls else None
             finish_reason = "tool_calls" if tool_calls else "stop"
@@ -1004,7 +1009,9 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
 
     text = clean_output(raw)
     print(f"[mlxsv] raw_output={text[:2000]!r}")
-    raw_calls = extract_tool_calls(text, req.tools) if (req.tools and gemma_native) else None
+    raw_calls = (
+        extract_tool_calls(text, req.tools) if (req.tools and gemma_native) else None
+    )
     tool_calls = _dedup_cap_calls(raw_calls) if raw_calls else None
     finish_reason = "tool_calls" if tool_calls else "stop"
     reasoning = extract_reasoning(text) if tool_calls else text
