@@ -5,18 +5,14 @@ import re
 import threading
 import time
 import uuid
-import warnings
 from typing import Any, Optional
 
 try:
-    import optiq  # registers qwen3_5_text model type with mlx_lm
-    from optiq.core.turbo_kv_cache import TurboQuantKVCache, patch_attention
-
-    _HAS_TURBO = True
+    import optiq  # registers OptiQ model types with mlx_lm
 except Exception:
-    _HAS_TURBO = False
+    pass
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
@@ -25,35 +21,19 @@ from pydantic import BaseModel
 app = FastAPI()
 
 DEFAULT_MODEL_NAME = "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
-STALE_MODEL_ALIASES = {
-    "mlx",
-    "mlx-community",
-    "mlx-community/Qwen3.5-4B-OptiQ-4bit",
-    "mlx-community/Qwen3-14B-4bit",
-    "PewterZz/OmniCoder-9B-abliterated-MLX-4bit",
-}
 
 
 def resolve_model_name() -> str:
     configured = (os.environ.get("MLX_MODEL") or "").strip()
     if not configured:
         return DEFAULT_MODEL_NAME
-    if configured in STALE_MODEL_ALIASES:
-        warnings.warn(
-            f"MLX_MODEL={configured} is stale; using {DEFAULT_MODEL_NAME} instead.",
-            stacklevel=2,
-        )
-        return DEFAULT_MODEL_NAME
     return configured
 
 
 MODEL_NAME = resolve_model_name()
 PUBLIC_MODEL_NAME = MODEL_NAME
-MODEL_FAMILY = "gemma4" if "gemma-4" in MODEL_NAME.lower() else "generic"
 
 model, tokenizer = load(MODEL_NAME)
-if _HAS_TURBO:
-    patch_attention()
 _eos_ids = getattr(tokenizer, "eos_token_ids", None)
 if _eos_ids is not None:
     for _token in ("<turn|>", "<end_of_turn>", "<|end_of_turn|>"):
@@ -63,29 +43,13 @@ if _eos_ids is not None:
                 _eos_ids.add(_token_id)
             else:
                 _eos_ids.append(_token_id)
-_text_cfg = getattr(model.args, "text_config", {})
-_head_dim = (
-    _text_cfg.get("head_dim")
-    if isinstance(_text_cfg, dict)
-    else getattr(_text_cfg, "head_dim", None)
-) or 128
 _inference_lock = threading.Lock()
 
 
 def _make_turbo_cache():
     from mlx_lm.models.cache import make_prompt_cache
 
-    # ❗ disable Turbo for Gemma
-    if not _HAS_TURBO or MODEL_FAMILY == "gemma4":
-        return make_prompt_cache(model)
-
-    from mlx_lm.models.cache import KVCache
-
-    caches = make_prompt_cache(model)
-    for i, c in enumerate(caches):
-        if isinstance(c, KVCache):
-            caches[i] = TurboQuantKVCache(head_dim=_head_dim, bits=4)
-    return caches
+    return make_prompt_cache(model)
 
 
 try:
@@ -111,8 +75,8 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     max_tokens: Optional[int] = 32768
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 0.95
     presence_penalty: Optional[float] = None
     stream: Optional[bool] = False
     tools: Optional[list[Any]] = None
@@ -143,20 +107,12 @@ def normalize_content(content: Any) -> str:
     return str(content)
 
 
-def _safe_tool_content(raw: str) -> str:
-    return re.sub(
-        r"<(/?tool_call|function=\w+|/function|parameter=\w+|/parameter)>",
-        r"[\1]",
-        raw,
-    )
-
-
 def _tool_response_payload(raw: str) -> Any:
     try:
         val = json.loads(raw)
         return val if val is not None else "null"
     except (json.JSONDecodeError, TypeError, ValueError):
-        return _safe_tool_content(raw)
+        return raw
 
 
 def _tool_call_name_by_id(tool_calls: Any) -> dict[str, str]:
@@ -173,6 +129,17 @@ def _tool_call_name_by_id(tool_calls: Any) -> dict[str, str]:
             if isinstance(name, str) and name:
                 names[call_id] = name
     return names
+
+
+def strip_gemma_thoughts(text: str) -> str:
+    """Strip generated Gemma thinking blocks from reusable assistant history."""
+    text = re.sub(r"(?s)<\|channel>thought\s*.*?<channel\|>", "", text)
+    text = re.sub(r"(?s)<\|think\|>.*?<\|/think\|>", "", text)
+    text = re.sub(r"(?s)<\|channel>thought\s*.*$", "", text)
+    text = re.sub(r"(?s)<\|think\|>.*$", "", text)
+    for token in ("<|channel>", "<channel|>", "<|think|>", "<|/think|>"):
+        text = text.replace(token, "")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def message_to_dict(m: ChatMessage, tool_names: dict[str, str] | None = None) -> dict:
@@ -196,47 +163,76 @@ def message_to_dict(m: ChatMessage, tool_names: dict[str, str] | None = None) ->
             "tool_calls": cooked,
         }
     elif m.role == "tool":
-        # Sanitize any tool-call XML embedded in fetched content (e.g. docs pages
-        # that contain <function=...> or <tool_call> code examples) so the parser
-        # doesn't fire on them when this result re-enters the context.
         raw = normalize_content(m.content)
-        if MODEL_FAMILY == "gemma4":
-            name = (
-                m.name
-                or (tool_names or {}).get(m.tool_call_id or "")
-                or (m.tool_call_id or "tool")
-            )
-            msg = {
-                "role": "tool",
-                "content": "",
-                "tool_call_id": m.tool_call_id or "0",
-                "tool_responses": [
-                    {
-                        "name": name,
-                        "response": _tool_response_payload(raw),
-                    }
-                ],
-            }
-        else:
-            msg = {
-                "role": "user",
-                "content": f"<tool_response>\n{_safe_tool_content(raw)}\n</tool_response>",
-            }
+        name = (
+            m.name
+            or (tool_names or {}).get(m.tool_call_id or "")
+            or (m.tool_call_id or "tool")
+        )
+        msg = {
+            "role": "tool",
+            "content": "",
+            "tool_call_id": m.tool_call_id or "0",
+            "tool_responses": [
+                {
+                    "name": name,
+                    "response": _tool_response_payload(raw),
+                }
+            ],
+        }
+    elif m.role == "assistant":
+        msg = {
+            "role": "assistant",
+            "content": strip_gemma_thoughts(normalize_content(m.content)),
+        }
     else:
         msg = {"role": m.role, "content": normalize_content(m.content)}
     return msg
 
 
-def messages_to_dicts(messages: list[ChatMessage]) -> list[dict]:
+def messages_to_dicts(messages: list[ChatMessage], *, gemma_native: bool) -> list[dict]:
     """Convert messages while preserving tool-call id -> function name context."""
     out: list[dict] = []
     tool_names: dict[str, str] = {}
     for message in messages:
         converted = message_to_dict(message, tool_names)
-        out.append(converted)
+        if converted.get("role") == "tool" and gemma_native:
+            _attach_gemma_tool_response(out, converted)
+        else:
+            out.append(converted)
         if message.role == "assistant" and message.tool_calls:
             tool_names.update(_tool_call_name_by_id(converted.get("tool_calls")))
     return out
+
+
+def _attach_gemma_tool_response(out: list[dict], tool_message: dict) -> None:
+    """Attach OpenAI-style tool messages using Gemma 4's assistant format.
+
+    Gemma 4's chat template renders tool results from assistant messages that
+    contain both `tool_calls` and `tool_responses`.
+    """
+    responses = tool_message.get("tool_responses") or []
+    if not responses:
+        return
+
+    tool_call_id = tool_message.get("tool_call_id")
+    for msg in reversed(out):
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+        if tool_call_id and not _assistant_has_tool_call_id(msg, tool_call_id):
+            continue
+        msg.setdefault("tool_responses", []).extend(responses)
+        return
+
+    # Keep malformed histories visible instead of dropping the tool output.
+    out.append(tool_message)
+
+
+def _assistant_has_tool_call_id(msg: dict, tool_call_id: str) -> bool:
+    for call in msg.get("tool_calls") or []:
+        if isinstance(call, dict) and call.get("id") == tool_call_id:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -245,12 +241,7 @@ def messages_to_dicts(messages: list[ChatMessage]) -> list[dict]:
 
 
 def _unescape_value(s: str, *, decode_control_escapes: bool) -> str:
-    """Decode escapes in a parsed tool argument value.
-
-    Qwen compact tool-call arguments may use <|"|>...<|"|> delimited strings.
-    Preserve source escapes for delimited strings so patch_file_tool can match
-    file contents such as `"one\\ntwo"` or `.join("\\n")`.
-    """
+    """Decode escapes in a parsed Gemma tool argument value."""
     result: list[str] = []
     i = 0
     n = len(s)
@@ -287,7 +278,7 @@ def _unescape_value(s: str, *, decode_control_escapes: bool) -> str:
     return "".join(result)
 
 
-def _normalize_qwen_args(raw: str) -> dict | None:
+def _normalize_gemma_args(raw: str) -> dict | None:
     trimmed = raw.strip()
     if trimmed.startswith("{{") and trimmed.endswith("}}"):
         trimmed = trimmed[1:-1]
@@ -391,13 +382,13 @@ def _normalize_qwen_args(raw: str) -> dict | None:
     return args or None
 
 
-_COMPACT_CALL_PREFIX = "<|tool_call>call:"
+_GEMMA_CALL_PREFIXES = ("<|tool_call>call:", "<|tool_call|>call:")
 
 
-def _parse_qwen_compact_call_name_and_body_start(
-    text: str, start: int
+def _parse_gemma_call_name_and_body_start(
+    text: str, start: int, prefix: str
 ) -> tuple[str, int] | None:
-    j = start + len(_COMPACT_CALL_PREFIX)
+    j = start + len(prefix)
     name_start = j
     while j < len(text) and (text[j].isalnum() or text[j] == "_"):
         j += 1
@@ -411,7 +402,7 @@ def _parse_qwen_compact_call_name_and_body_start(
     return name, j
 
 
-def _scan_qwen_compact_body(text: str, body_start: int) -> tuple[str, int] | None:
+def _scan_gemma_call_body(text: str, body_start: int) -> tuple[str, int] | None:
     depth = 0
     k = body_start
     while k < len(text):
@@ -436,131 +427,49 @@ def _scan_qwen_compact_body(text: str, body_start: int) -> tuple[str, int] | Non
     return None
 
 
-def _scan_qwen_compact_calls(text: str) -> list[tuple[str, str]]:
+def _find_next_gemma_call_prefix(text: str, pos: int) -> tuple[int, str]:
+    matches = [
+        (idx, prefix)
+        for prefix in _GEMMA_CALL_PREFIXES
+        if (idx := text.find(prefix, pos)) >= 0
+    ]
+    return min(matches, key=lambda item: item[0]) if matches else (-1, "")
+
+
+def _scan_gemma_calls(text: str) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     pos = 0
+    close_tag = "<tool_call|>"
     while True:
-        i = text.find(_COMPACT_CALL_PREFIX, pos)
+        i, prefix = _find_next_gemma_call_prefix(text, pos)
         if i < 0:
             break
-        parsed = _parse_qwen_compact_call_name_and_body_start(text, i)
+        parsed = _parse_gemma_call_name_and_body_start(text, i, prefix)
         if parsed is None:
-            pos = i + len(_COMPACT_CALL_PREFIX)
+            pos = i + len(prefix)
             continue
         name, body_start = parsed
-        scanned = _scan_qwen_compact_body(text, body_start)
+        scanned = _scan_gemma_call_body(text, body_start)
         if scanned is None:
             pos = body_start + 1
             continue
-        body, pos = scanned
+        body, body_end = scanned
+        tail = text[body_end:].lstrip()
+        if not tail.startswith(close_tag):
+            pos = body_end
+            continue
+        pos = body_end + (len(text[body_end:]) - len(tail)) + len(close_tag)
         results.append((name, body))
     return results
 
 
-def extract_tool_calls(text: str) -> list[dict] | None:
+def extract_tool_calls(text: str, tools: Any = None) -> list[dict] | None:
     calls: list[dict] = []
-    matched_path: str | None = None
-    decoder = json.JSONDecoder()
     normalized = text.replace('<|"|>', '"')
 
-    for m in re.finditer(r"<tool_call>\s*(\{)", normalized, re.DOTALL):
-        start = m.start(1)
-        try:
-            data, _ = decoder.raw_decode(normalized, start)
-            if isinstance(data, dict) and "name" in data:
-                matched_path = "standard_xml_json"
-                calls.append(
-                    {
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {
-                            "name": data["name"],
-                            "arguments": json.dumps(data.get("arguments", {})),
-                        },
-                    }
-                )
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-    if calls:
-        print(f"[mlxsv] extract_tool_calls matched={matched_path} count={len(calls)}")
-        return calls
-
-    for m in re.finditer(
-        r"(?s)<tool_call>\s*<function=(\w+)>\s*(.*?)\s*</function>\s*</tool_call>",
-        normalized,
-    ):
-        name = m.group(1)
-        body = m.group(2)
-        args: dict[str, Any] = {}
-
-        for p in re.finditer(
-            r"(?s)<parameter=([A-Za-z_]\w*)>\s*(.*?)\s*</parameter>",
-            body,
-        ):
-            key = p.group(1)
-            raw_value = p.group(2).strip()
-            if raw_value.startswith("{") and raw_value.endswith("}"):
-                parsed = _normalize_qwen_args(raw_value)
-                args[key] = parsed if parsed is not None else raw_value
-            elif raw_value in {"true", "false"}:
-                args[key] = raw_value == "true"
-            elif raw_value == "null":
-                args[key] = None
-            else:
-                try:
-                    args[key] = int(raw_value)
-                except ValueError:
-                    try:
-                        args[key] = float(raw_value)
-                    except ValueError:
-                        args[key] = raw_value
-
-        matched_path = "xml_function_parameters"
-        calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args),
-                },
-            }
-        )
-
-    if calls:
-        print(f"[mlxsv] extract_tool_calls matched={matched_path} count={len(calls)}")
-        return calls
-
-    for m in re.finditer(r"<\|tool_call>call:\s*(\{)", normalized, re.DOTALL):
-        start = m.start(1)
-        try:
-            data, _ = decoder.raw_decode(normalized, start)
-            if isinstance(data, dict) and "name" in data:
-                matched_path = "qwen_hybrid_json"
-                calls.append(
-                    {
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {
-                            "name": data["name"],
-                            "arguments": json.dumps(data.get("arguments", {})),
-                        },
-                    }
-                )
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-    if calls:
-        print(f"[mlxsv] extract_tool_calls matched={matched_path} count={len(calls)}")
-        return calls
-
-    for name, body in _scan_qwen_compact_calls(text):
-        args = _normalize_qwen_args(body)
+    for name, body in _scan_gemma_calls(text):
+        args = _normalize_gemma_args(body)
         if args is not None:
-            matched_path = (
-                "gemma_native" if MODEL_FAMILY == "gemma4" else "qwen_compact_native"
-            )
             calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -573,7 +482,7 @@ def extract_tool_calls(text: str) -> list[dict] | None:
             )
 
     if calls:
-        print(f"[mlxsv] extract_tool_calls matched={matched_path} count={len(calls)}")
+        print(f"[mlxsv] extract_tool_calls matched=gemma_native count={len(calls)}")
         return calls
 
     print(f"[mlxsv] extract_tool_calls matched=none sample={normalized[:300]!r}")
@@ -604,36 +513,46 @@ def _dedup_cap_calls(calls: list[dict]) -> list[dict]:
 
 
 def clean_output(text: str) -> str:
-    """Remove control tokens and thinking blocks."""
-    # Truncate at model turn boundaries before stripping markers so raw tool calls
-    # remain parseable while hallucinated next turns do not bleed into the result.
-    boundaries = [
-        "<|im_end|>",
-        "<turn|>",
-        "<|turn>user",
-        "<|turn>system",
-        "<|turn>assistant",
-        "<|turn>model",
-    ]
-    cut = min(
-        [idx for marker in boundaries if (idx := text.find(marker)) != -1]
-        or [len(text)]
-    )
-    text = text[:cut]
-    text = re.sub(r"(?s)<\|channel>thought\s*.*?<channel\|>", "", text)
-    text = re.sub(r"(?s)<\|think\|>.*?<\|/think\|>", "", text)
-    text = re.sub(r"(?s)<think>.*?</think>", "", text)
-    text = re.sub(r"(?s)<thinking>.*?</thinking>", "", text)
-    for token in [
-        "<turn|>",
-        "<|turn>",
-        "<|think|>",
-        "<|/think|>",
-        "<|channel>thought",
-        "<channel|>",
-    ]:
-        text = text.replace(token, "")
+    """Preserve raw model output in Gemma-native mode."""
     return text.strip()
+
+
+def _tool_streamable_thought_delta(text: str, emitted: int) -> tuple[str, int]:
+    """Return only thought-block text safe to stream before tool parsing.
+
+    Tool calls are parsed after generation, so visible answer text must stay
+    buffered. Explicit thinking blocks are safe to pass through because the ACP
+    client routes them to the thought stream.
+    """
+    stripped = text.lstrip()
+    if stripped.startswith(("<|tool_call>", "<|tool_call|>", "<tool_call|>", "call:")):
+        return "", emitted
+
+    open_tags = ["<|think|>", "<|channel>thought"]
+    close_tags = ["<|/think|>", "<channel|>"]
+
+    close = _earliest_tag(text, close_tags)
+    if close is not None:
+        close_idx, close_tag = close
+        safe_end = close_idx + len(close_tag)
+    else:
+        opened = _earliest_tag(text, open_tags)
+        if opened is None:
+            return "", emitted
+        open_idx, _ = opened
+        if emitted < open_idx:
+            emitted = open_idx
+        hold = max(len(tag) for tag in close_tags) - 1
+        safe_end = max(0, len(text) - hold)
+
+    if safe_end <= emitted:
+        return "", emitted
+    return text[emitted:safe_end], safe_end
+
+
+def _earliest_tag(text: str, tags: list[str]) -> tuple[int, str] | None:
+    found = [(idx, tag) for tag in tags if (idx := text.find(tag)) >= 0]
+    return min(found, key=lambda item: item[0]) if found else None
 
 
 # ---------------------------------------------------------------------------
@@ -654,41 +573,15 @@ def _msg_chars(msg: dict) -> int:
 
 
 def _is_tool_response(msg: dict) -> bool:
-    if msg.get("role") == "tool":
-        return False
-    content = msg.get("content") or ""
-    return isinstance(content, str) and content.startswith("<tool_response>")
-
-
-def _batch_tool_responses(messages: list[dict]) -> list[dict]:
-    """Merge consecutive tool-response user messages into one user message.
-
-    The Qwen3.5 chat template expects all tool results for a turn in a single
-    user message with multiple <tool_response> blocks, not separate messages.
-    """
-    out: list[dict] = []
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        if _is_tool_response(msg):
-            combined = msg["content"]
-            i += 1
-            while i < len(messages) and _is_tool_response(messages[i]):
-                combined += "\n" + messages[i]["content"]
-                i += 1
-            out.append({"role": "user", "content": combined})
-        else:
-            out.append(msg)
-            i += 1
-    return out
+    return msg.get("role") == "tool"
 
 
 def _trim_anchor(anchor: list[dict]) -> list[dict]:
     """Keep the user message + as many recent tool pairs as fit in _MAX_ANCHOR_CHARS.
 
-    Tool results are user-role messages wrapped in <tool_response>. They always
-    appear after an assistant tool_calls message. We trim from the oldest pair
-    forward so the model always sees the most recent results.
+    Gemma 4 receives tool results as `tool_responses` attached to the assistant
+    message that contains `tool_calls`. We trim from the oldest message forward
+    so the model always sees the most recent results.
     """
     if len(anchor) <= 1:
         return anchor
@@ -702,7 +595,7 @@ def _trim_anchor(anchor: list[dict]) -> list[dict]:
             break
         kept.insert(0, msg)
         budget -= cost
-    # Don't start mid-pair with an orphaned tool_response.
+    # Don't start mid-pair with an orphaned tool response.
     while kept and _is_tool_response(kept[0]):
         kept.pop(0)
     return user_msg + kept
@@ -758,7 +651,7 @@ def truncate_messages(messages: list[dict]) -> list[dict]:
 
 def extract_reasoning(text: str) -> str | None:
     """Preserve everything before the first tool call marker."""
-    markers = ["<tool_call>", "<|tool_call>"]
+    markers = ["<|tool_call>", "<|tool_call|>"]
     cut = len(text)
     for marker in markers:
         pos = text.find(marker)
@@ -793,8 +686,6 @@ def _extract_thought(text: str) -> str | None:
     for pattern in [
         r"(?s)<\|channel>thought\s*(.*?)<channel\|>",
         r"(?s)<\|think\|>(.*?)<\|/think\|>",
-        r"(?s)<think>(.*?)</think>",
-        r"(?s)<thinking>(.*?)</thinking>",
     ]:
         m = re.search(pattern, text)
         if m:
@@ -827,7 +718,7 @@ def _coerce_bool(value: Any) -> Optional[bool]:
 def _requested_enable_thinking(
     req: ChatCompletionRequest, messages: list[dict[str, Any]]
 ) -> bool:
-    """Prefer explicit API config; keep /no_think only as a compatibility fallback."""
+    """Prefer explicit API config; default to Gemma thinking enabled."""
     template_kwargs = _chat_template_kwargs(req)
     explicit = _coerce_bool(template_kwargs.get("enable_thinking"))
     if explicit is not None:
@@ -837,12 +728,59 @@ def _requested_enable_thinking(
     if explicit is not None:
         return explicit
 
-    no_think = any(
-        "/no_think" in (msg.get("content") or "")
+    return True
+
+
+def _is_gemma_native_model(model_name: str) -> bool:
+    lowered = (model_name or "").lower()
+    return "gemma-4" in lowered or "gemma 4" in lowered
+
+
+def _consolidate_system_messages(
+    messages: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Gemma 4 expects thinking/tool setup consolidated in one system turn."""
+    system_parts = [
+        normalize_content(msg.get("content")).strip()
         for msg in messages
-        if msg.get("role") == "system"
+        if msg.get("role") == "system" and normalize_content(msg.get("content")).strip()
+    ]
+    non_system = [msg for msg in messages if msg.get("role") != "system"]
+    if not system_parts:
+        return non_system
+    return [{"role": "system", "content": "\n\n".join(system_parts)}] + non_system
+
+
+def _apply_gemma_thinking_marker(
+    messages: list[dict[str, Any]], enable_thinking: bool
+) -> list[dict[str, Any]]:
+    """Use Gemma's system-token thinking control in addition to template kwargs."""
+    out = [dict(msg) for msg in messages]
+    system_index = next(
+        (idx for idx, msg in enumerate(out) if msg.get("role") == "system"),
+        None,
     )
-    return not no_think
+    if system_index is None:
+        if enable_thinking:
+            out.insert(0, {"role": "system", "content": "<|think|>"})
+        return out
+
+    content = normalize_content(out[system_index].get("content"))
+    content = content.replace("<|think|>", "").strip()
+    if enable_thinking:
+        content = f"<|think|>\n{content}" if content else "<|think|>"
+    out[system_index]["content"] = content
+    return out
+
+
+def _prefill_empty_thought_channel(prompt: str, enable_thinking: bool) -> str:
+    """Stabilize no-thinking generations using Gemma's empty thought channel."""
+    if enable_thinking:
+        return prompt
+    prefill = "<|channel>thought\n<channel|>"
+    if prompt.rstrip().endswith(prefill):
+        return prompt
+    return f"{prompt}{prefill}"
 
 
 def _extra_number(req: ChatCompletionRequest, key: str) -> Any:
@@ -865,13 +803,14 @@ def _log_first_message(messages: list[dict[str, Any]]) -> None:
 
 
 def _make_sampler(req: ChatCompletionRequest):
-    temperature = req.temperature if req.temperature is not None else 0.7
+    temperature = req.temperature if req.temperature is not None else 1.0
+    top_k = _extra_number(req, "top_k")
     kwargs: dict[str, Any] = {}
 
     candidates = {
-        "top_p": req.top_p,
+        "top_p": req.top_p if req.top_p is not None else 0.95,
         "min_p": _extra_number(req, "min_p"),
-        "top_k": _extra_number(req, "top_k"),
+        "top_k": top_k if top_k is not None else 64,
         "repetition_penalty": _extra_number(req, "repetition_penalty"),
         "presence_penalty": req.presence_penalty,
     }
@@ -887,12 +826,14 @@ def _make_sampler(req: ChatCompletionRequest):
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest):
-    messages = messages_to_dicts(req.messages)
-    messages = _batch_tool_responses(messages)
+def chat_completions(req: ChatCompletionRequest, request: Request):
+    gemma_native = _is_gemma_native_model(req.model or MODEL_NAME)
+    messages = messages_to_dicts(req.messages, gemma_native=gemma_native)
     messages = truncate_messages(messages)
+    messages = _consolidate_system_messages(messages)
 
     requested_enable_thinking = _requested_enable_thinking(req, messages)
+    messages = _apply_gemma_thinking_marker(messages, requested_enable_thinking)
 
     print(
         f"[mlxsv] chat_completions tools_in_request={len(req.tools or [])} "
@@ -919,29 +860,21 @@ def chat_completions(req: ChatCompletionRequest):
         dropped = template_kwargs.pop("enable_thinking", None)
         if dropped is not None:
             print(f"[mlxsv] template_warning dropped=enable_thinking reason={e!r}")
-        if dropped is False:
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "Non-thinking mode requires chat_template_kwargs.enable_thinking=False support in the tokenizer chat template.",
-                        "type": "template_configuration_error",
-                    }
-                },
-                status_code=500,
-            )
         try:
             prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
         except Exception as e2:
             template_kwargs.pop("tools", None)
             print(f"[mlxsv] template_warning dropped=tools reason={e2!r}")
             prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+    prompt = _prefill_empty_thought_channel(prompt, requested_enable_thinking)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     if req.stream:
 
-        def event_stream():
+        async def event_stream():
             accumulated = ""
+            tool_thought_emitted = 0
             with _inference_lock:
                 try:
                     from mlx_lm import stream_generate as _stream_gen
@@ -954,8 +887,31 @@ def chat_completions(req: ChatCompletionRequest):
                         sampler=_make_sampler(req),
                         prompt_cache=_make_turbo_cache(),
                     ):
+                        if await request.is_disconnected():
+                            print("[mlxsv] stream_cancelled client_disconnected=True")
+                            return
                         token = resp.text
                         accumulated += token
+                        if req.tools:
+                            chunk, tool_thought_emitted = _tool_streamable_thought_delta(
+                                accumulated, tool_thought_emitted
+                            )
+                            if chunk:
+                                delta_chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": PUBLIC_MODEL_NAME,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": chunk},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(delta_chunk)}\n\n"
+                            continue
                         delta_chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -971,6 +927,9 @@ def chat_completions(req: ChatCompletionRequest):
                         }
                         yield f"data: {json.dumps(delta_chunk)}\n\n"
                 except Exception:
+                    if await request.is_disconnected():
+                        print("[mlxsv] stream_cancelled before_fallback=True")
+                        return
                     # Fallback: generate all at once, send as single chunk
                     raw = generate(
                         model,
@@ -981,25 +940,32 @@ def chat_completions(req: ChatCompletionRequest):
                         prompt_cache=_make_turbo_cache(),
                     )
                     accumulated = raw
-                    delta_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": PUBLIC_MODEL_NAME,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": accumulated},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(delta_chunk)}\n\n"
+                    if not req.tools:
+                        delta_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": PUBLIC_MODEL_NAME,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": accumulated},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(delta_chunk)}\n\n"
+
+            if await request.is_disconnected():
+                print("[mlxsv] stream_cancelled after_generation=True")
+                return
 
             # After stream ends, parse tool calls from full accumulated text.
             text = clean_output(accumulated)
             print(f"[mlxsv] raw_output={text[:2000]!r}")
-            raw_calls = extract_tool_calls(text) if req.tools else None
+            raw_calls = (
+                extract_tool_calls(text, req.tools) if (req.tools and gemma_native) else None
+            )
             tool_calls = _dedup_cap_calls(raw_calls) if raw_calls else None
             finish_reason = "tool_calls" if tool_calls else "stop"
             print(
@@ -1009,6 +975,8 @@ def chat_completions(req: ChatCompletionRequest):
             final_delta: dict[str, Any] = {}
             if tool_calls:
                 final_delta["tool_calls"] = tool_calls
+            elif req.tools and text:
+                final_delta["content"] = text
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -1036,7 +1004,7 @@ def chat_completions(req: ChatCompletionRequest):
 
     text = clean_output(raw)
     print(f"[mlxsv] raw_output={text[:2000]!r}")
-    raw_calls = extract_tool_calls(text) if req.tools else None
+    raw_calls = extract_tool_calls(text, req.tools) if (req.tools and gemma_native) else None
     tool_calls = _dedup_cap_calls(raw_calls) if raw_calls else None
     finish_reason = "tool_calls" if tool_calls else "stop"
     reasoning = extract_reasoning(text) if tool_calls else text
