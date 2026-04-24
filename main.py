@@ -560,8 +560,8 @@ def _earliest_tag(text: str, tags: list[str]) -> tuple[int, str] | None:
 # Context truncation
 # ---------------------------------------------------------------------------
 
-_MAX_CONTEXT_CHARS = 100_000
-_MAX_ANCHOR_CHARS = 75_000
+_MAX_CONTEXT_CHARS = 160_000
+_MAX_ANCHOR_CHARS = 120_000
 
 
 def _msg_chars(msg: dict) -> int:
