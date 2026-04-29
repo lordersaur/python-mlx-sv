@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-DEFAULT_MODEL_NAME = "google/gemma-3-4b-it"
+DEFAULT_MODEL_NAME = "unsloth/gemma-4-E4B-it"
 
 MODEL_NAME = (os.environ.get("VLLM_MODEL") or "").strip() or DEFAULT_MODEL_NAME
 PUBLIC_MODEL_NAME = MODEL_NAME
