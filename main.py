@@ -1,31 +1,39 @@
+import asyncio
 import json
 import os
+import queue
 import re
+import threading
 import time
 import uuid
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from llama_cpp import Llama
 from transformers import AutoTokenizer
-from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.async_llm_engine import AsyncLLMEngine
 from pydantic import BaseModel
 
 app = FastAPI()
 
-DEFAULT_MODEL_NAME = "unsloth/gemma-4-E4B-it-GGUF"
-_GGUF_FILE = "gemma-4-E4B-it-Q8_0.gguf"
+DEFAULT_MODEL_REPO = "unsloth/gemma-4-E4B-it-GGUF"
+DEFAULT_MODEL_FILE = "gemma-4-E4B-it-Q8_0.gguf"
 _TOKENIZER_NAME = "unsloth/gemma-4-E4B-it"
 
-MODEL_NAME = (os.environ.get("VLLM_MODEL") or "").strip() or DEFAULT_MODEL_NAME
-PUBLIC_MODEL_NAME = MODEL_NAME
+MODEL_REPO = (os.environ.get("MODEL_REPO") or "").strip() or DEFAULT_MODEL_REPO
+MODEL_FILE = (os.environ.get("MODEL_FILE") or "").strip() or DEFAULT_MODEL_FILE
+PUBLIC_MODEL_NAME = f"{MODEL_REPO}/{MODEL_FILE}"
 
-engine = AsyncLLMEngine.from_engine_args(
-    AsyncEngineArgs(model=MODEL_NAME, tokenizer=_TOKENIZER_NAME, gguf_file=_GGUF_FILE)
+llm = Llama.from_pretrained(
+    repo_id=MODEL_REPO,
+    filename=MODEL_FILE,
+    n_gpu_layers=-1,
+    n_ctx=8192,
+    verbose=False,
 )
 tokenizer = AutoTokenizer.from_pretrained(_TOKENIZER_NAME)
+
+_inference_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -640,23 +648,23 @@ def _apply_thinking_marker(messages: list[dict], enable_thinking: bool) -> list[
     return out
 
 
-def _make_sampling_params(req: ChatCompletionRequest) -> SamplingParams:
+def _make_gen_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
     extra = _extra_body(req)
     kwargs: dict[str, Any] = {
+        "max_tokens": req.max_tokens or 32768,
         "temperature": req.temperature if req.temperature is not None else 1.0,
         "top_p": req.top_p if req.top_p is not None else 0.95,
-        "max_tokens": req.max_tokens or 32768,
         "stop": ["<end_of_turn>", "<|end_of_turn|>", "<turn|>"],
     }
     if extra.get("top_k") is not None:
         kwargs["top_k"] = extra["top_k"]
     if extra.get("min_p") is not None:
         kwargs["min_p"] = extra["min_p"]
-    if extra.get("repetition_penalty") is not None:
-        kwargs["repetition_penalty"] = extra["repetition_penalty"]
+    if extra.get("repeat_penalty") is not None:
+        kwargs["repeat_penalty"] = extra["repeat_penalty"]
     if req.presence_penalty is not None:
         kwargs["presence_penalty"] = req.presence_penalty
-    return SamplingParams(**kwargs)
+    return kwargs
 
 
 def _build_prompt(req: ChatCompletionRequest) -> tuple[str, bool]:
@@ -726,39 +734,46 @@ def list_models():
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     prompt, enable_thinking = _build_prompt(req)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-    request_id = uuid.uuid4().hex
-    sampling_params = _make_sampling_params(req)
+    gen_kwargs = _make_gen_kwargs(req)
 
     if req.stream:
 
         async def event_stream():
             accumulated = ""
             tool_thought_emitted = 0
-            prev_len = 0
-            try:
-                async for output in engine.generate(
-                    prompt, sampling_params, request_id=request_id
-                ):
-                    if await request.is_disconnected():
-                        print("[vllmsv] stream_cancelled client_disconnected=True")
-                        await engine.abort(request_id)
-                        return
-                    full_text = output.outputs[0].text
-                    token = full_text[prev_len:]
-                    prev_len = len(full_text)
-                    accumulated = full_text
-                    if req.tools:
-                        chunk, tool_thought_emitted = _tool_streamable_thought_delta(
-                            accumulated, tool_thought_emitted
-                        )
-                        if chunk:
-                            yield f"data: {json.dumps(_chunk(completion_id, chunk))}\n\n"
-                        continue
-                    if token:
-                        yield f"data: {json.dumps(_chunk(completion_id, token))}\n\n"
-            except Exception as e:
-                print(f"[vllmsv] stream_error={e!r}")
-                return
+            token_queue: queue.Queue = queue.Queue()
+
+            def producer():
+                try:
+                    with _inference_lock:
+                        for chunk in llm(prompt, stream=True, **gen_kwargs):
+                            token_queue.put(chunk["choices"][0]["text"])
+                except Exception as e:
+                    print(f"[vllmsv] stream_error={e!r}")
+                finally:
+                    token_queue.put(None)
+
+            thread = threading.Thread(target=producer, daemon=True)
+            thread.start()
+
+            loop = asyncio.get_event_loop()
+            while True:
+                if await request.is_disconnected():
+                    print("[vllmsv] stream_cancelled client_disconnected=True")
+                    return
+                token = await loop.run_in_executor(None, token_queue.get)
+                if token is None:
+                    break
+                accumulated += token
+                if req.tools:
+                    chunk, tool_thought_emitted = _tool_streamable_thought_delta(
+                        accumulated, tool_thought_emitted
+                    )
+                    if chunk:
+                        yield f"data: {json.dumps(_chunk(completion_id, chunk))}\n\n"
+                    continue
+                if token:
+                    yield f"data: {json.dumps(_chunk(completion_id, token))}\n\n"
 
             if await request.is_disconnected():
                 print("[vllmsv] stream_cancelled after_generation=True")
@@ -781,11 +796,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     # Non-streaming path.
-    final_output = None
-    async for output in engine.generate(prompt, sampling_params, request_id=request_id):
-        final_output = output
+    with _inference_lock:
+        output = llm(prompt, **gen_kwargs)
 
-    raw = final_output.outputs[0].text if final_output else ""
+    raw = output["choices"][0]["text"]
     text = raw.strip()
     print(f"[vllmsv] raw_output={text[:2000]!r}")
     tool_calls = extract_tool_calls(text) if req.tools else None
