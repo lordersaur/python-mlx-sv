@@ -1,49 +1,27 @@
-import inspect
 import json
 import os
 import re
-import threading
 import time
 import uuid
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from mlx_lm import generate, load
-from mlx_lm.sample_utils import make_sampler
+from transformers import AutoTokenizer
+from vllm import SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 from pydantic import BaseModel
 
 app = FastAPI()
 
-DEFAULT_MODEL_NAME = "unsloth/gemma-4-E4B-it-MLX-8bit"
+DEFAULT_MODEL_NAME = "google/gemma-3-4b-it"
 
-MODEL_NAME = (os.environ.get("MLX_MODEL") or "").strip() or DEFAULT_MODEL_NAME
+MODEL_NAME = (os.environ.get("VLLM_MODEL") or "").strip() or DEFAULT_MODEL_NAME
 PUBLIC_MODEL_NAME = MODEL_NAME
 
-model, tokenizer = load(MODEL_NAME)
-
-# Register Gemma end-of-turn tokens as EOS so generation stops cleanly.
-_eos_ids = getattr(tokenizer, "eos_token_ids", None)
-if _eos_ids is not None:
-    for _token in ("<turn|>", "<end_of_turn>", "<|end_of_turn|>"):
-        _token_id = tokenizer.convert_tokens_to_ids(_token)
-        if isinstance(_token_id, int) and _token_id >= 0 and _token_id not in _eos_ids:
-            if hasattr(_eos_ids, "add"):
-                _eos_ids.add(_token_id)
-            else:
-                _eos_ids.append(_token_id)
-
-_inference_lock = threading.Lock()
-
-try:
-    _SAMPLER_PARAMS = set(inspect.signature(make_sampler).parameters)
-except (TypeError, ValueError):
-    _SAMPLER_PARAMS = set()
-
-
-def _make_prompt_cache():
-    from mlx_lm.models.cache import make_prompt_cache
-    return make_prompt_cache(model)
+engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(model=MODEL_NAME))
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -455,10 +433,10 @@ def extract_tool_calls(text: str) -> list[dict] | None:
                 deduped.append(c)
                 if len(deduped) >= _MAX_TOOL_CALLS:
                     break
-        print(f"[mlxsv] extract_tool_calls matched=gemma_native count={len(deduped)}")
+        print(f"[vllmsv] extract_tool_calls matched=gemma_native count={len(deduped)}")
         return deduped
 
-    print(f"[mlxsv] extract_tool_calls matched=none sample={text[:300]!r}")
+    print(f"[vllmsv] extract_tool_calls matched=none sample={text[:300]!r}")
     return None
 
 
@@ -586,7 +564,7 @@ def truncate_messages(messages: list[dict]) -> list[dict]:
 
     dropped = len(middle) - len(kept)
     if dropped:
-        print(f"[mlxsv] context_truncated dropped_turns={dropped} kept_turns={len(kept)}")
+        print(f"[vllmsv] context_truncated dropped_turns={dropped} kept_turns={len(kept)}")
 
     return system + kept + anchor
 
@@ -658,27 +636,23 @@ def _apply_thinking_marker(messages: list[dict], enable_thinking: bool) -> list[
     return out
 
 
-def _make_sampler(req: ChatCompletionRequest):
-    temperature = req.temperature if req.temperature is not None else 1.0
-    params = _SAMPLER_PARAMS
+def _make_sampling_params(req: ChatCompletionRequest) -> SamplingParams:
     extra = _extra_body(req)
-    kwargs: dict[str, Any] = {}
-    candidates = {
+    kwargs: dict[str, Any] = {
+        "temperature": req.temperature if req.temperature is not None else 1.0,
         "top_p": req.top_p if req.top_p is not None else 0.95,
-        "top_k": extra.get("top_k", 64),
-        "min_p": extra.get("min_p"),
-        "repetition_penalty": extra.get("repetition_penalty"),
-        "presence_penalty": req.presence_penalty,
+        "max_tokens": req.max_tokens or 32768,
+        "stop": ["<end_of_turn>", "<|end_of_turn|>", "<turn|>"],
     }
-    for key, value in candidates.items():
-        if value is not None and key in params:
-            kwargs[key] = value
-
-    if "temp" in params:
-        return make_sampler(temp=temperature, **kwargs)
-    if "temperature" in params:
-        return make_sampler(temperature=temperature, **kwargs)
-    return make_sampler(temperature, **kwargs)
+    if extra.get("top_k") is not None:
+        kwargs["top_k"] = extra["top_k"]
+    if extra.get("min_p") is not None:
+        kwargs["min_p"] = extra["min_p"]
+    if extra.get("repetition_penalty") is not None:
+        kwargs["repetition_penalty"] = extra["repetition_penalty"]
+    if req.presence_penalty is not None:
+        kwargs["presence_penalty"] = req.presence_penalty
+    return SamplingParams(**kwargs)
 
 
 def _build_prompt(req: ChatCompletionRequest) -> tuple[str, bool]:
@@ -692,7 +666,7 @@ def _build_prompt(req: ChatCompletionRequest) -> tuple[str, bool]:
 
     roles = "→".join(m["role"] for m in messages)
     print(
-        f"[mlxsv] chat_completions tools_in_request={len(req.tools or [])} "
+        f"[vllmsv] chat_completions tools_in_request={len(req.tools or [])} "
         f"messages={len(messages)} enable_thinking={enable_thinking} roles={roles}",
         flush=True,
     )
@@ -713,12 +687,12 @@ def _build_prompt(req: ChatCompletionRequest) -> tuple[str, bool]:
     except Exception as e:
         dropped = template_kwargs.pop("enable_thinking", None)
         if dropped is not None:
-            print(f"[mlxsv] template_warning dropped=enable_thinking reason={e!r}")
+            print(f"[vllmsv] template_warning dropped=enable_thinking reason={e!r}")
         try:
             prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
         except Exception as e2:
             template_kwargs.pop("tools", None)
-            print(f"[mlxsv] template_warning dropped=tools reason={e2!r}")
+            print(f"[vllmsv] template_warning dropped=tools reason={e2!r}")
             prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
 
     return prompt, enable_thinking
@@ -745,63 +719,52 @@ def list_models():
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest, request: Request):
+async def chat_completions(req: ChatCompletionRequest, request: Request):
     prompt, enable_thinking = _build_prompt(req)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    request_id = uuid.uuid4().hex
+    sampling_params = _make_sampling_params(req)
 
     if req.stream:
 
         async def event_stream():
             accumulated = ""
             tool_thought_emitted = 0
-            with _inference_lock:
-                try:
-                    from mlx_lm import stream_generate as _stream_gen
-
-                    for resp in _stream_gen(
-                        model,
-                        tokenizer,
-                        prompt=prompt,
-                        max_tokens=req.max_tokens or 32768,
-                        sampler=_make_sampler(req),
-                        prompt_cache=_make_prompt_cache(),
-                    ):
-                        if await request.is_disconnected():
-                            print("[mlxsv] stream_cancelled client_disconnected=True")
-                            return
-                        token = resp.text
-                        accumulated += token
-                        if req.tools:
-                            chunk, tool_thought_emitted = _tool_streamable_thought_delta(
-                                accumulated, tool_thought_emitted
-                            )
-                            if chunk:
-                                yield f"data: {json.dumps(_chunk(completion_id, chunk))}\n\n"
-                            continue
-                        yield f"data: {json.dumps(_chunk(completion_id, token))}\n\n"
-                except Exception:
+            prev_len = 0
+            try:
+                async for output in engine.generate(
+                    prompt, sampling_params, request_id=request_id
+                ):
                     if await request.is_disconnected():
-                        print("[mlxsv] stream_cancelled before_fallback=True")
+                        print("[vllmsv] stream_cancelled client_disconnected=True")
+                        await engine.abort(request_id)
                         return
-                    raw = generate(
-                        model, tokenizer, prompt=prompt,
-                        max_tokens=req.max_tokens or 32768,
-                        sampler=_make_sampler(req),
-                        prompt_cache=_make_prompt_cache(),
-                    )
-                    accumulated = raw
-                    if not req.tools:
-                        yield f"data: {json.dumps(_chunk(completion_id, raw))}\n\n"
+                    full_text = output.outputs[0].text
+                    token = full_text[prev_len:]
+                    prev_len = len(full_text)
+                    accumulated = full_text
+                    if req.tools:
+                        chunk, tool_thought_emitted = _tool_streamable_thought_delta(
+                            accumulated, tool_thought_emitted
+                        )
+                        if chunk:
+                            yield f"data: {json.dumps(_chunk(completion_id, chunk))}\n\n"
+                        continue
+                    if token:
+                        yield f"data: {json.dumps(_chunk(completion_id, token))}\n\n"
+            except Exception as e:
+                print(f"[vllmsv] stream_error={e!r}")
+                return
 
             if await request.is_disconnected():
-                print("[mlxsv] stream_cancelled after_generation=True")
+                print("[vllmsv] stream_cancelled after_generation=True")
                 return
 
             text = accumulated.strip()
-            print(f"[mlxsv] raw_output={text[:2000]!r}")
+            print(f"[vllmsv] raw_output={text[:2000]!r}")
             tool_calls = extract_tool_calls(text) if req.tools else None
             finish_reason = "tool_calls" if tool_calls else "stop"
-            print(f"[mlxsv] finish_reason={finish_reason} tool_call_count={len(tool_calls or [])}")
+            print(f"[vllmsv] finish_reason={finish_reason} tool_call_count={len(tool_calls or [])}")
 
             final_delta: dict[str, Any] = {}
             if tool_calls:
@@ -814,21 +777,18 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     # Non-streaming path.
-    with _inference_lock:
-        raw = generate(
-            model, tokenizer, prompt=prompt,
-            max_tokens=req.max_tokens or 32768,
-            sampler=_make_sampler(req),
-            prompt_cache=_make_prompt_cache(),
-        )
+    final_output = None
+    async for output in engine.generate(prompt, sampling_params, request_id=request_id):
+        final_output = output
 
+    raw = final_output.outputs[0].text if final_output else ""
     text = raw.strip()
-    print(f"[mlxsv] raw_output={text[:2000]!r}")
+    print(f"[vllmsv] raw_output={text[:2000]!r}")
     tool_calls = extract_tool_calls(text) if req.tools else None
     finish_reason = "tool_calls" if tool_calls else "stop"
     reasoning = extract_reasoning(text) if tool_calls else text
 
-    print(f"[mlxsv] finish_reason={finish_reason} tool_call_count={len(tool_calls or [])}")
+    print(f"[vllmsv] finish_reason={finish_reason} tool_call_count={len(tool_calls or [])}")
     response_message: dict[str, Any] = {"role": "assistant", "content": reasoning}
     if tool_calls:
         response_message["tool_calls"] = tool_calls
