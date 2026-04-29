@@ -15,13 +15,17 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-DEFAULT_MODEL_NAME = "unsloth/gemma-4-E4B-it"
+DEFAULT_MODEL_NAME = "unsloth/gemma-4-E4B-it-GGUF"
+_GGUF_FILE = "gemma-4-E4B-it-Q8_0.gguf"
+_TOKENIZER_NAME = "unsloth/gemma-4-E4B-it"
 
 MODEL_NAME = (os.environ.get("VLLM_MODEL") or "").strip() or DEFAULT_MODEL_NAME
 PUBLIC_MODEL_NAME = MODEL_NAME
 
-engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(model=MODEL_NAME))
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+engine = AsyncLLMEngine.from_engine_args(
+    AsyncEngineArgs(model=MODEL_NAME, tokenizer=_TOKENIZER_NAME, gguf_file=_GGUF_FILE)
+)
+tokenizer = AutoTokenizer.from_pretrained(_TOKENIZER_NAME)
 
 
 # ---------------------------------------------------------------------------
