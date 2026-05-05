@@ -102,7 +102,7 @@ def create_app() -> FastAPI:
             )
         prompt, _enable_thinking = build_prompt(req, runtime)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        gen_kwargs = make_gen_kwargs(req)
+        gen_kwargs = make_gen_kwargs(req, runtime)
         session_id = str(extra_body(req).get("session_id") or "").strip() or None
         expose_thoughts = requested_expose_thoughts(req)
         max_tokens = req.max_tokens or 32768

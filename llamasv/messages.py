@@ -23,17 +23,27 @@ def normalize_content(content: Any) -> str:
     return str(content)
 
 
-def strip_gemma_thoughts(text: str) -> str:
+def strip_reasoning_blocks(text: str) -> str:
     text = re.sub(r"(?s)<\|channel>thought\s*.*?<channel\|>", "", text)
     text = re.sub(r"(?s)<\|think\|>.*?<\|/think\|>", "", text)
+    text = re.sub(r"(?s)<think>\s*.*?</think>", "", text)
     text = re.sub(r"(?s)<\|channel>thought\s*.*$", "", text)
     text = re.sub(r"(?s)<\|think\|>.*$", "", text)
-    for token in ("<|channel>", "<channel|>", "<|think|>", "<|/think|>"):
+    text = re.sub(r"(?s)<think>\s*.*$", "", text)
+    for token in (
+        "<|channel>",
+        "<channel|>",
+        "<|think|>",
+        "<|/think|>",
+        "<think>",
+        "</think>",
+    ):
         text = text.replace(token, "")
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def strip_tool_call_markup(text: str) -> str:
+    text = re.sub(r"(?s)<tool_call>\s*.*?</tool_call>", "", text)
     text = re.sub(
         r"(?s)<\|tool_call\|?>call:.*?<tool_call\|>",
         "",
@@ -58,7 +68,7 @@ def strip_tool_call_markup(text: str) -> str:
 
 
 def public_response_text(text: str, *, hide_tool_calls: bool = False) -> str:
-    text = strip_gemma_thoughts(text)
+    text = strip_reasoning_blocks(text)
     if hide_tool_calls:
         text = strip_tool_call_markup(text)
     return text
@@ -110,7 +120,12 @@ def _attach_gemma_tool_response(out: list[dict], tool_message: dict) -> None:
     out.append(tool_message)
 
 
-def message_to_dict(m: ChatMessage, tool_names: dict[str, str] | None = None) -> dict:
+def message_to_dict(
+    m: ChatMessage,
+    tool_names: dict[str, str] | None = None,
+    *,
+    model_family: str = "generic",
+) -> dict:
     if m.role == "assistant" and m.tool_calls:
         cooked: list[Any] = []
         for tc in m.tool_calls:
@@ -136,6 +151,13 @@ def message_to_dict(m: ChatMessage, tool_names: dict[str, str] | None = None) ->
             or (tool_names or {}).get(m.tool_call_id or "")
             or (m.tool_call_id or "tool")
         )
+        if model_family != "gemma":
+            return {
+                "role": "tool",
+                "content": raw,
+                "tool_call_id": m.tool_call_id or "0",
+                "name": name,
+            }
         return {
             "role": "tool",
             "content": "",
@@ -145,17 +167,23 @@ def message_to_dict(m: ChatMessage, tool_names: dict[str, str] | None = None) ->
     if m.role == "assistant":
         return {
             "role": "assistant",
-            "content": strip_gemma_thoughts(normalize_content(m.content)),
+            "content": strip_reasoning_blocks(normalize_content(m.content)),
         }
     return {"role": m.role, "content": normalize_content(m.content)}
 
 
-def messages_to_dicts(messages: list[ChatMessage]) -> list[dict]:
+def messages_to_dicts(
+    messages: list[ChatMessage], *, model_family: str = "generic"
+) -> list[dict]:
     out: list[dict] = []
     tool_names: dict[str, str] = {}
     for message in messages:
-        converted = message_to_dict(message, tool_names)
-        if converted.get("role") == "tool":
+        converted = message_to_dict(
+            message,
+            tool_names,
+            model_family=model_family,
+        )
+        if converted.get("role") == "tool" and model_family == "gemma":
             _attach_gemma_tool_response(out, converted)
         else:
             out.append(converted)

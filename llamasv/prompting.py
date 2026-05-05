@@ -1,13 +1,18 @@
 from typing import Any, Optional
 
 from .messages import messages_to_dicts, normalize_content
-from .runtime import AppRuntime, STOP_TOKENS
+from .runtime import AppRuntime, stop_tokens_for_model_family
 from .schemas import ChatCompletionRequest
 
 TITLE_GENERATOR_SYSTEM_MARKERS = (
     "you are a title generator",
     "you output only a thread title",
 )
+DEFAULT_TEMPERATURE_BY_FAMILY = {
+    "qwen": 0.7,
+    "gemma": 1.0,
+    "generic": 1.0,
+}
 
 
 def extra_body(req: ChatCompletionRequest) -> dict[str, Any]:
@@ -157,7 +162,9 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
     return [{"role": "system", "content": "\n\n".join(system_parts)}] + non_system
 
 
-def _apply_thinking_marker(messages: list[dict], enable_thinking: bool) -> list[dict]:
+def _apply_gemma_thinking_marker(
+    messages: list[dict], enable_thinking: bool
+) -> list[dict]:
     out = [dict(msg) for msg in messages]
     system_index = next(
         (idx for idx, msg in enumerate(out) if msg.get("role") == "system"), None
@@ -174,13 +181,17 @@ def _apply_thinking_marker(messages: list[dict], enable_thinking: bool) -> list[
     return out
 
 
-def make_gen_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
+def make_gen_kwargs(req: ChatCompletionRequest, runtime: AppRuntime) -> dict[str, Any]:
     extra = extra_body(req)
-    stop_tokens = list(STOP_TOKENS)
-    if req.tools:
+    stop_tokens = list(stop_tokens_for_model_family(runtime.settings.model_family))
+    if req.tools and runtime.settings.model_family == "gemma":
         stop_tokens.append("<tool_call|>")
     kwargs: dict[str, Any] = {
-        "temperature": req.temperature if req.temperature is not None else 1.0,
+        "temperature": (
+            req.temperature
+            if req.temperature is not None
+            else DEFAULT_TEMPERATURE_BY_FAMILY.get(runtime.settings.model_family, 1.0)
+        ),
         "top_p": req.top_p if req.top_p is not None else 0.95,
         "top_k": int(extra.get("top_k", 64)),
         "stop": stop_tokens,
@@ -201,7 +212,8 @@ def _render_prompt(
 ) -> tuple[str, bool]:
     enable_thinking = requested_enable_thinking(req)
     messages = _consolidate_system_messages(messages)
-    messages = _apply_thinking_marker(messages, enable_thinking)
+    if runtime.settings.model_family == "gemma":
+        messages = _apply_gemma_thinking_marker(messages, enable_thinking)
 
     roles = "→".join(m["role"] for m in messages)
     print(
@@ -262,7 +274,10 @@ def _prompt_token_budget(req: ChatCompletionRequest, n_ctx: int) -> int:
 
 
 def build_prompt(req: ChatCompletionRequest, runtime: AppRuntime) -> tuple[str, bool]:
-    original_messages = messages_to_dicts(req.messages)
+    original_messages = messages_to_dicts(
+        req.messages,
+        model_family=runtime.settings.model_family,
+    )
     working_messages = truncate_messages(original_messages, runtime.settings.n_ctx)
     prompt_budget = _prompt_token_budget(req, runtime.settings.n_ctx)
 

@@ -3,6 +3,13 @@ import re
 import uuid
 from typing import Any
 
+QWEN_TOOL_BLOCK_RE = re.compile(
+    r"(?s)<tool_call>\s*<function=([A-Za-z_][A-Za-z0-9_.-]*)>\s*(.*?)\s*</function>\s*</tool_call>"
+)
+QWEN_PARAMETER_RE = re.compile(
+    r"(?s)<parameter=([A-Za-z_][A-Za-z0-9_.-]*)>\s*(.*?)\s*</parameter>"
+)
+
 
 def _unescape_value(s: str, *, decode_control_escapes: bool) -> str:
     result: list[str] = []
@@ -63,6 +70,32 @@ def _normalize_gemma_args(raw: str) -> dict | None:
     if i != len(trimmed) or not isinstance(value, dict):
         return None
     return value
+
+
+def _coerce_tool_value(raw: str) -> Any:
+    trimmed = raw.strip()
+    if not trimmed:
+        return ""
+    if trimmed in {"true", "false"}:
+        return trimmed == "true"
+    if trimmed == "null":
+        return None
+    if re.fullmatch(r"-?\d+", trimmed):
+        try:
+            return int(trimmed)
+        except ValueError:
+            return trimmed
+    if re.fullmatch(r"-?\d+\.\d+", trimmed):
+        try:
+            return float(trimmed)
+        except ValueError:
+            return trimmed
+    if trimmed[0] in {'"', "{", "["}:
+        try:
+            return json.loads(trimmed)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return trimmed
+    return trimmed
 
 
 def _skip_gemma_ws(text: str, i: int) -> int:
@@ -303,13 +336,33 @@ def _scan_gemma_calls(text: str) -> list[tuple[str, str]]:
     return results
 
 
+def _scan_qwen_calls(text: str) -> list[tuple[str, dict[str, Any]]]:
+    results: list[tuple[str, dict[str, Any]]] = []
+    for match in QWEN_TOOL_BLOCK_RE.finditer(text):
+        name = match.group(1)
+        body = match.group(2).strip()
+        args: dict[str, Any] = {}
+        if body.startswith("{") and body.endswith("}"):
+            parsed = _normalize_gemma_args(body)
+            if isinstance(parsed, dict):
+                args = parsed
+        else:
+            for param in QWEN_PARAMETER_RE.finditer(body):
+                args[param.group(1)] = _coerce_tool_value(param.group(2))
+        results.append((name, args))
+    return results
+
+
 _FALLBACK_CALL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*\{")
 _BARE_TOOL_LINE_RE = re.compile(r"(?m)^(?!\[)([a-z_][a-z0-9_]*)\s*$")
 
 
 def has_tool_call_cue(text: str) -> bool:
     tail = text[-1024:]
-    if any(marker in tail for marker in ("<|tool_call", "<tool_call|>")):
+    if any(
+        marker in tail
+        for marker in ("<|tool_call", "<tool_call|>", "<tool_call>", "<function=")
+    ):
         return True
     if _FALLBACK_CALL_RE.search(tail):
         return True
@@ -363,15 +416,11 @@ def _scan_bare_tool_lines(text: str) -> list[tuple[str, str]]:
 
 def extract_tool_calls(text: str) -> list[dict] | None:
     calls: list[dict] = []
-    scanned_calls = _scan_gemma_calls(text)
-    if not scanned_calls:
-        scanned_calls = _scan_fallback_calls(text)
-    if not scanned_calls:
-        scanned_calls = _scan_bare_tool_lines(text)
-
-    for name, body in scanned_calls:
-        args = _normalize_gemma_args(body)
-        if args is not None:
+    scanned_mode = "none"
+    scanned_qwen_calls = _scan_qwen_calls(text)
+    if scanned_qwen_calls:
+        scanned_mode = "qwen_xml"
+        for name, args in scanned_qwen_calls:
             calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -379,6 +428,28 @@ def extract_tool_calls(text: str) -> list[dict] | None:
                     "function": {"name": name, "arguments": json.dumps(args)},
                 }
             )
+
+    scanned_calls = _scan_gemma_calls(text) if not calls else []
+    if not scanned_calls:
+        scanned_calls = _scan_fallback_calls(text)
+        if scanned_calls:
+            scanned_mode = "fallback"
+    if not scanned_calls:
+        scanned_calls = _scan_bare_tool_lines(text)
+        if scanned_calls:
+            scanned_mode = "bare_line"
+
+    if scanned_calls and not calls:
+        for name, body in scanned_calls:
+            args = _normalize_gemma_args(body)
+            if args is not None:
+                calls.append(
+                    {
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args)},
+                    }
+                )
 
     if calls:
         seen: set[tuple[str, str]] = set()
@@ -391,13 +462,16 @@ def extract_tool_calls(text: str) -> list[dict] | None:
                 deduped.append(call)
                 if len(deduped) >= MAX_TOOL_CALLS:
                     break
-        if _scan_gemma_calls(text):
-            mode = "gemma_native"
-        elif _scan_fallback_calls(text):
-            mode = "fallback"
-        else:
-            mode = "bare_line"
-        print(f"[llamasv] extract_tool_calls matched={mode} count={len(deduped)}")
+        if scanned_mode == "none":
+            if _scan_gemma_calls(text):
+                scanned_mode = "gemma_native"
+            elif _scan_fallback_calls(text):
+                scanned_mode = "fallback"
+            else:
+                scanned_mode = "bare_line"
+        print(
+            f"[llamasv] extract_tool_calls matched={scanned_mode} count={len(deduped)}"
+        )
         return deduped
 
     print(f"[llamasv] extract_tool_calls matched=none sample={text[:300]!r}")
@@ -411,11 +485,20 @@ def _earliest_tag(text: str, tags: list[str]) -> tuple[int, str] | None:
 
 def tool_streamable_thought_delta(text: str, emitted: int) -> tuple[str, int]:
     stripped = text.lstrip()
-    if stripped.startswith(("<|tool_call>", "<|tool_call|>", "<tool_call|>", "call:")):
+    if stripped.startswith(
+        (
+            "<|tool_call>",
+            "<|tool_call|>",
+            "<tool_call|>",
+            "<tool_call>",
+            "<function=",
+            "call:",
+        )
+    ):
         return "", emitted
 
-    open_tags = ["<|think|>", "<|channel>thought"]
-    close_tags = ["<|/think|>", "<channel|>"]
+    open_tags = ["<think>", "<|think|>", "<|channel>thought"]
+    close_tags = ["</think>", "<|/think|>", "<channel|>"]
 
     close = _earliest_tag(text, close_tags)
     if close is not None:
@@ -437,7 +520,7 @@ def tool_streamable_thought_delta(text: str, emitted: int) -> tuple[str, int]:
 
 
 def extract_reasoning(text: str) -> str | None:
-    markers = ["<|tool_call>", "<|tool_call|>"]
+    markers = ["<tool_call>", "<|tool_call>", "<|tool_call|>"]
     cut = len(text)
     for marker in markers:
         pos = text.find(marker)

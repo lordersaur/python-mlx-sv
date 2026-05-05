@@ -10,9 +10,16 @@ from fastapi import FastAPI
 from llama_cpp import Llama
 from transformers import AutoTokenizer
 
-STOP_TOKENS = ["<end_of_turn>", "<|end_of_turn|>", "<turn|>", "<|tool_response>"]
-DEFAULT_GGUF_PATH = os.path.expanduser("/home/gs/Downloads/gemma-4-E4B-it-Q8_0.gguf")
-DEFAULT_HF_MODEL = "google/gemma-4-e4b-it"
+COMMON_STOP_TOKENS = ("<|im_end|>",)
+FAMILY_STOP_TOKENS = {
+    "gemma": ("<end_of_turn>", "<|end_of_turn|>", "<turn|>", "<|tool_response>"),
+    "qwen": ("<tool_response>",),
+    "generic": (),
+}
+DEFAULT_GGUF_PATH = os.path.expanduser(
+    "~/Downloads/Qwen3.5-9B-DeepSeek-V4-Flash-Q6_K.gguf"
+)
+DEFAULT_HF_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_N_GPU_LAYERS = -1
 DEFAULT_N_CTX = 32768
 
@@ -21,6 +28,7 @@ DEFAULT_N_CTX = 32768
 class Settings:
     gguf_path: str
     hf_model_id: str
+    model_family: str
     n_gpu_layers: int
     n_ctx: int
     llama_verbose: bool
@@ -37,9 +45,23 @@ class AppRuntime:
     raw_output_log_lock: threading.Lock
 
 
+def infer_model_family(hf_model_id: str) -> str:
+    lowered = hf_model_id.lower()
+    if "qwen" in lowered:
+        return "qwen"
+    if "gemma" in lowered:
+        return "gemma"
+    return "generic"
+
+
+def stop_tokens_for_model_family(model_family: str) -> tuple[str, ...]:
+    return COMMON_STOP_TOKENS + FAMILY_STOP_TOKENS.get(model_family, ())
+
+
 def load_settings() -> Settings:
     gguf_path = (os.environ.get("GGUF_MODEL_PATH") or "").strip() or DEFAULT_GGUF_PATH
     hf_model_id = (os.environ.get("HF_MODEL_ID") or "").strip() or DEFAULT_HF_MODEL
+    model_family = infer_model_family(hf_model_id)
     n_gpu_layers = int(os.environ.get("N_GPU_LAYERS", str(DEFAULT_N_GPU_LAYERS)))
     n_ctx = int(os.environ.get("N_CTX", str(DEFAULT_N_CTX)))
     llama_verbose = (os.environ.get("LLAMA_VERBOSE") or "0").strip().lower() not in {
@@ -57,6 +79,7 @@ def load_settings() -> Settings:
     return Settings(
         gguf_path=gguf_path,
         hf_model_id=hf_model_id,
+        model_family=model_family,
         n_gpu_layers=n_gpu_layers,
         n_ctx=n_ctx,
         llama_verbose=llama_verbose,
@@ -65,7 +88,9 @@ def load_settings() -> Settings:
     )
 
 
-def _register_stop_tokens(tokenizer: AutoTokenizer) -> None:
+def _register_stop_tokens(
+    tokenizer: AutoTokenizer, stop_tokens: tuple[str, ...]
+) -> None:
     eos_ids = getattr(tokenizer, "eos_token_ids", None)
     if isinstance(eos_ids, int):
         eos_ids = [eos_ids]
@@ -74,7 +99,7 @@ def _register_stop_tokens(tokenizer: AutoTokenizer) -> None:
     if not hasattr(eos_ids, "add") and not hasattr(eos_ids, "append"):
         eos_ids = list(eos_ids)
 
-    for token in STOP_TOKENS:
+    for token in stop_tokens:
         token_id = tokenizer.convert_tokens_to_ids(token)
         if isinstance(token_id, int) and token_id >= 0 and token_id not in eos_ids:
             if hasattr(eos_ids, "add"):
@@ -90,7 +115,12 @@ def create_runtime() -> AppRuntime:
     print(f"[llamasv] Loading tokenizer from: {settings.hf_model_id}", flush=True)
     print(
         f"[llamasv] n_gpu_layers={settings.n_gpu_layers} "
-        f"n_ctx={settings.n_ctx} verbose={settings.llama_verbose}",
+        f"n_ctx={settings.n_ctx} verbose={settings.llama_verbose} "
+        f"model_family={settings.model_family}",
+        flush=True,
+    )
+    print(
+        f"[llamasv] stop_tokens={list(stop_tokens_for_model_family(settings.model_family))}",
         flush=True,
     )
     print(
@@ -106,7 +136,10 @@ def create_runtime() -> AppRuntime:
         verbose=settings.llama_verbose,
     )
     tokenizer = AutoTokenizer.from_pretrained(settings.hf_model_id)
-    _register_stop_tokens(tokenizer)
+    _register_stop_tokens(
+        tokenizer,
+        stop_tokens_for_model_family(settings.model_family),
+    )
 
     return AppRuntime(
         settings=settings,
